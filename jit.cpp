@@ -11,31 +11,75 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/Pass.h"
-#include "llvm/Support/InitLLVM.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/CFLSteensAliasAnalysis.h"
-#include "llvm/Analysis/TypeBasedAliasAnalysis.h"
-#include "llvm/Analysis/ScopedNoAliasAA.h"
+#include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/ScopedNoAliasAA.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/TypeBasedAliasAnalysis.h"
+#include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
-#include "llvm/Transforms/Vectorize.h"
 #include "llvm/Transforms/Utils.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
+#include "llvm/Transforms/Vectorize.h"
 
-#include "./ExampleModules.h"
+//#include "./ExampleModules.h"
 
 #define USE_MAP
 
 using namespace llvm;
 using namespace llvm::orc;
+
+inline Error createSMDiagnosticError(llvm::SMDiagnostic &Diag) {
+  std::string Msg;
+  {
+    raw_string_ostream OS(Msg);
+    Diag.print("", OS);
+  }
+  return make_error<StringError>(std::move(Msg), inconvertibleErrorCode());
+}
+// Returns the TargetMachine instance or zero if no triple is provided.
+static TargetMachine* GetTargetMachine(Triple TheTriple, StringRef CPUStr,
+                                       StringRef FeaturesStr,
+                                       const TargetOptions &Options) {
+  std::string Error;
+  const Target *TheTarget =
+      TargetRegistry::lookupTarget(codegen::getMArch(), TheTriple, Error);
+  // Some modules don't specify a triple, and this is okay.
+  if (!TheTarget) {
+    return nullptr;
+  }
+
+  return TheTarget->createTargetMachine(
+      TheTriple.getTriple(), codegen::getCPUStr(), codegen::getFeaturesStr(),
+      Options, codegen::getExplicitRelocModel(),
+      codegen::getExplicitCodeModel(), CodeGenOpt::Aggressive);
+}
 
 // A function object that creates a simple pass pipeline to apply to each
 // module as it passes through the IRTransformLayer.
@@ -43,135 +87,96 @@ class MyOptimizationTransform {
 public:
   MyOptimizationTransform() : PM(std::make_unique<legacy::PassManager>()) {
 
-    PM->add(createCFLSteensAAWrapperPass());
-    PM->add(createTypeBasedAAWrapperPass());
-    PM->add(createScopedNoAliasAAWrapperPass());
-    PM->add(createIPSCCPPass());
-    PM->add(createGlobalOptimizerPass());
-    PM->add(createPromoteMemoryToRegisterPass());
-    PM->add(createGlobalsAAWrapperPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createFunctionInliningPass());
-    PM->add(createPostOrderFunctionAttrsLegacyPass());
-    PM->add(createSROAPass());
-    PM->add(createEarlyCSEPass(true));
-    PM->add(createGVNHoistPass());
-    PM->add(createGVNSinkPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createConstraintEliminationPass());
-    PM->add(createJumpThreadingPass());
-    PM->add(createCorrelatedValuePropagationPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createAggressiveInstCombinerPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createTailCallEliminationPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createReassociatePass());
-    PM->add(createVectorCombinePass());
-    PM->add(createLoopInstSimplifyPass());
-    PM->add(createLoopSimplifyCFGPass());
-    PM->add(createLICMPass());
-    PM->add(createLoopRotatePass());
-    PM->add(createLICMPass());
-    PM->add(createSimpleLoopUnswitchLegacyPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createLoopFlattenPass());
-    PM->add(createLoopSimplifyCFGPass());
-    PM->add(createLoopIdiomPass());
-    PM->add(createIndVarSimplifyPass());
-    PM->add(createLoopDeletionPass());
-    PM->add(createLoopInterchangePass());
-    PM->add(createSimpleLoopUnrollPass());
-    PM->add(createSROAPass());
-    PM->add(createNewGVNPass());
-    PM->add(createSCCPPass());
-    PM->add(createConstraintEliminationPass());
-    PM->add(createBitTrackingDCEPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createDFAJumpThreadingPass());
-    PM->add(createJumpThreadingPass());
-    PM->add(createCorrelatedValuePropagationPass());
-    PM->add(createAggressiveDCEPass());
-    PM->add(createMemCpyOptPass());
-    PM->add(createDeadStoreEliminationPass());
-    PM->add(createLICMPass());
-    PM->add(createLoopRerollPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createPartialInliningPass());
-    PM->add(createReversePostOrderFunctionAttrsPass());
-    PM->add(createGlobalOptimizerPass());
-    PM->add(createGlobalDCEPass());
-    PM->add(createLoopVersioningLICMPass());
-    PM->add(createLICMPass());
-    PM->add(createGlobalsAAWrapperPass());
-    PM->add(createFloat2IntPass());
-    PM->add(createLowerConstantIntrinsicsPass());
-    PM->add(createLowerMatrixIntrinsicsPass());
-    PM->add(createEarlyCSEPass(false));
-    PM->add(createLoopRotatePass());
-    PM->add(createLoopDistributePass());
-    PM->add(createLoopVectorizePass());
-    PM->add(createLoopLoadEliminationPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createEarlyCSEPass());
-    PM->add(createCorrelatedValuePropagationPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createLICMPass());
-    PM->add(createSimpleLoopUnswitchLegacyPass());
-    PM->add(createCFGSimplificationPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createCFGSimplificationPass(SimplifyCFGOptions()
-                                           .forwardSwitchCondToPhi(true)
-                                           .convertSwitchRangeToICmp(true)
-                                           .convertSwitchToLookupTable(true)
-                                           .needCanonicalLoops(false)
-                                           .hoistCommonInsts(true)
-                                           .sinkCommonInsts(true)));
-    PM->add(createSLPVectorizerPass());
-    PM->add(createEarlyCSEPass());
-    PM->add(createVectorCombinePass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createLoopUnrollAndJamPass());
-    PM->add(createLoopUnrollPass());
-    PM->add(createInstructionCombiningPass());
-    PM->add(createLICMPass());
-    PM->add(createGlobalDCEPass());
-    PM->add(createConstantMergePass());
-    PM->add(createLoopSinkPass());
-    PM->add(createInstSimplifyLegacyPass());
-    PM->add(createDivRemPairsPass());
-    PM->add(createCFGSimplificationPass(
-        SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
-
 #if 0
+    PM->add(createTailCallEliminationPass());
     PM->add(createFunctionInliningPass());
-    PM->add(createSCCPPass());
+    PM->add(createIndVarSimplifyPass());
     PM->add(createCFGSimplificationPass());
-    PM->add(createLoopVectorizePass());
-    PM->add(createSLPVectorizerPass());
-    PM->add(createCFGSimplificationPass());
+    PM->add(createLICMPass());
 #endif
-
-    //PM->add(createTailCallEliminationPass());
-    //PM->add(createFunctionInliningPass());
-    //PM->add(createIndVarSimplifyPass());
-    //PM->add(createCFGSimplificationPass());
-
-    //PM->add(createCFGSimplificationPass());
-    //PM->add(createAggressiveDCEPass());
-    //PM->add(createEarlyCSEPass());
-    //PM->add(createSROAPass());
-    //PM->add(createCFGSimplificationPass());
   }
 
   Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
                                         MaterializationResponsibility &R) {
     TSM.withModuleDo([this](Module &M) {
-      //dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
-      PM->run(M);
-      //dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n";
+      for (Function &F : M) {
+        // Set linkonce_odr symbols to external to avoid removing them during
+        // optimization.
+        if (F.hasLinkOnceODRLinkage())
+          F.setLinkage(GlobalValue::ExternalLinkage);
+      }
+
+#if 0
+      dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
+#endif
+
+      Triple ModuleTriple(M.getTargetTriple());
+      std::string CPUStr, FeaturesStr;
+      TargetMachine *Machine = nullptr;
+      const TargetOptions Options =
+          codegen::InitTargetOptionsFromCodeGenFlags(ModuleTriple);
+
+      if (ModuleTriple.getArch()) {
+        CPUStr = codegen::getCPUStr();
+        FeaturesStr = codegen::getFeaturesStr();
+        Machine = GetTargetMachine(ModuleTriple, CPUStr, FeaturesStr, Options);
+      } else if (ModuleTriple.getArchName() != "unknown" &&
+                 ModuleTriple.getArchName() != "") {
+        errs() << "unrecognized architecture '"
+               << ModuleTriple.getArchName() << "' provided.\n";
+        abort();
+      }
+      std::unique_ptr<TargetMachine> TM(Machine);
+      codegen::setFunctionAttributes(CPUStr, FeaturesStr, M);
+      TargetLibraryInfoImpl TLII(ModuleTriple);
+      legacy::PassManager MPasses;
+
+      MPasses.add(new TargetLibraryInfoWrapperPass(TLII));
+      MPasses.add(createTargetTransformInfoWrapperPass(
+          TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis()));
+
+      std::unique_ptr<legacy::FunctionPassManager> FPasses;
+      FPasses.reset(new legacy::FunctionPassManager(&M));
+      FPasses->add(createTargetTransformInfoWrapperPass(
+          TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis()));
+
+      if (TM) {
+        // FIXME: We should dyn_cast this when supported.
+        auto &LTM = static_cast<LLVMTargetMachine &>(*TM);
+        Pass *TPC = LTM.createPassConfig(MPasses);
+        MPasses.add(TPC);
+      }
+
+      unsigned int OptLevel = 3;
+
+      {
+        //TimeTraceScope T("Builder");
+        PassManagerBuilder Builder;
+        Builder.OptLevel = OptLevel;
+        Builder.SizeLevel = 0;
+        Builder.Inliner = createFunctionInliningPass(OptLevel, 0, false);
+        Builder.DisableUnrollLoops = false;
+        Builder.LoopVectorize = true;
+        Builder.SLPVectorize = true;
+        TM->adjustPassManager(Builder);
+        Builder.populateFunctionPassManager(*FPasses);
+        Builder.populateModulePassManager(MPasses);
+      }
+
+      {
+        //TimeTraceScope T("RunPassPipeline");
+        if (FPasses) {
+          FPasses->doInitialization();
+          for (Function &F : M)
+            FPasses->run(F);
+          FPasses->doFinalization();
+        }
+        MPasses.run(M);
+      }
+      //PM->run(M);
+#if 0
+      dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n";
+#endif
     });
     return std::move(TSM);
   }
@@ -191,6 +196,7 @@ struct RuntimeConstant {
 };
 
 
+static codegen::RegisterCodeGenFlags CFG;
 std::unique_ptr<LLJIT> J;
 // TODO: make it a singleton?
 class JitEngine {
@@ -235,12 +241,16 @@ public:
 #ifdef USE_LINKER
   parseSource(StringRef FnName, StringRef Suffix, StringRef IR,
 #endif
+#ifdef USE_MAP
   parseSource(StringRef FnName, StringRef IR,
+#endif
               RuntimeConstant *RC, int NumRuntimeConstants) {
+
+    //TimeTraceScope T("parseSource");
     auto Ctx = std::make_unique<LLVMContext>();
     SMDiagnostic Err;
     if (auto M = parseIR(MemoryBufferRef(IR, "Mod"), Err, *Ctx)) {
-      // dbgs() << "parsed Module " << *M << "\n";
+      //dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n";
       Function *F = M->getFunction(FnName);
 
       // Clone the function and replace argument uses with runtime constants.
@@ -274,23 +284,30 @@ public:
       F->eraseFromParent();
 
 #ifdef USE_MAP
+      NewF->setName(FnName);
+#endif
 #ifdef USE_LINKER
       NewF->setName(FnName + Suffix);
-#endif
-      NewF->setName(FnName);
-#endif
-#ifdef USE_LINKER
-      NewF->setName(FnName);
       for (Function &F : *M) {
         if (F.isDeclaration())
           continue;
+
+        if (&F == NewF)
+          continue;
+
         //dbgs() << "Rename F " << F.getName() << " -> " << F.getName() + Suffix;
-        F.setName(F.getName() + Suffix);
+        F.setName(F.getName() + ".." + NewF->getName());
       }
 #endif
       // dbgs() << "NewF " << *NewF << "\n";
       // getchar();
-      // dbgs() << "=== Modified Module\n" << *M << "***\n";
+#if 0
+      dbgs() << "=== Modified Module\n" << *M << "=== End of Modified Module\n";
+      if (verifyModule(*M, &errs()))
+        report_fatal_error("Broken module found, JIT compilation aborted!", false);
+      else
+        dbgs() << "Module verified!\n";
+#endif
       return ThreadSafeModule(std::move(M), std::move(Ctx));
     }
 
@@ -318,7 +335,8 @@ public:
     J->getIRTransformLayer().setTransform(MyOptimizationTransform());
 #endif
 
-    dbgs() << "======= COMPILING " << FnName << "=====================\n";
+    dbgs() << "======= COMPILING " << FnName << " =====================\n";
+    //getchar();
 #ifdef USE_LINKER
     std::string Suffix = mangleSuffix(FnName, RC, NumRuntimeConstants);
     std::string MangledFnName = FnName.str() + Suffix;
@@ -328,14 +346,18 @@ public:
 #ifdef USE_LINKER
         ExitOnErr(parseSource(FnName, Suffix, IR, RC, NumRuntimeConstants))));
 #endif
+#ifdef USE_MAP
         ExitOnErr(parseSource(FnName, IR, RC, NumRuntimeConstants))));
+#endif
 
     // (4) Look up the JIT'd function and call it.
     //dbgs() << "Lookup FnName " << FnName << "\n";
 #ifdef USE_LINKER
     auto EntryAddr = ExitOnErr(J->lookup(MangledFnName));
 #endif
+#ifdef USE_MAP
     auto EntryAddr = ExitOnErr(J->lookup(FnName));
+#endif
 
     return (void *)EntryAddr.getValue();
   }
@@ -344,7 +366,6 @@ public:
   std::string mangleSuffix(StringRef FnName, RuntimeConstant *RC,
                            int NumRuntimeConstants) {
     // Generate mangled name with runtime constants.
-    return "";
     std::string Suffix = ".";
     for (int I = 0; I < NumRuntimeConstants; ++I)
       Suffix += std::to_string(RC[I].Int64Val);
@@ -388,7 +409,7 @@ public:
     if (RuntimeConstants.size() > RHS.RuntimeConstants.size())
       return false;
 
-    // Functions have the number of runtime constant arguments.
+    // Functions have the same number of runtime constant arguments.
     for (int I = 0; I < RuntimeConstants.size(); ++I) {
       //dbgs() << "Compare I " << I << " " << RuntimeConstants[I].Int64Val << " < " << RHS.RuntimeConstants[I].Int64Val << "\n";
       if (RuntimeConstants[I].Int64Val < RHS.RuntimeConstants[I].Int64Val) {
@@ -420,24 +441,22 @@ raw_ostream& operator<<(raw_ostream& OS, JitFnKey& Key)
     return OS;
 }
 
-#ifdef KEEP_STATS
 int hits = 0;
 int total = 0;
-#endif
 
 JitEngine *Jit;
 __attribute__((constructor))
 void InitJit() {
   Jit = new JitEngine();
+  //timeTraceProfilerInitialize(500 /* us */, "jit");
 }
 
 __attribute__((destructor))
 void DeleteJit() {
+  //timeTraceProfilerWrite("", "-");
   delete Jit;
 
-#ifdef KEEP_STATS
   printf("hits %d total %d\n", hits, total);
-#endif
 }
 
 //std::unordered_map<Key, void *> JitCache;
@@ -445,11 +464,12 @@ void DeleteJit() {
 std::map<JitFnKey, void *> JitCache;
 #endif
 extern "C" {
-__attribute__((used,weak))
+__attribute__((used))
 void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
                   int NumRuntimeConstants) {
-#ifdef USE_LINKER
-  dbgs() << "v2 NumRuntimeConstants " << NumRuntimeConstants << "\n";
+  //TimeTraceScope T("__jit_entry");
+#if 0
+  dbgs() << "FnName " << FnName << " NumRuntimeConstants " << NumRuntimeConstants << "\n";
   for (int I = 0; I < NumRuntimeConstants; ++I)
     dbgs() << "RC[" << I << "]: ArgNo=" << RC[I].ArgNo
            << " Value Int32=" << RC[I].Int32Val
@@ -459,25 +479,31 @@ void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
            << "\n";
 #endif
 
-  JitFnKey Key(FnName, RC, NumRuntimeConstants);
-
-#ifdef KEEP_STATS
   total++;
-#endif
 #ifdef USE_LINKER
-  void *JitFnPtr = Jit->lookup(FnName, RC, NumRuntimeConstants);
-  if (!JitFnPtr)
+  void *JitFnPtr;
+  {
+    //TimeTraceScope T("findLinker");
+    JitFnPtr = Jit->lookup(FnName, RC, NumRuntimeConstants);
+  }
+  if (!JitFnPtr) {
+    //TimeTraceScope T("compileAndLink");
     JitFnPtr = Jit->compileAndLink(FnName, IR, RC, NumRuntimeConstants);
-#ifdef KEEP_STATS
+  }
   else
     hits++;
 #endif
-#endif
 
 #ifdef USE_MAP
+  JitFnKey Key(FnName, RC, NumRuntimeConstants);
   void *JitFnPtr;
-  auto It = JitCache.find(Key);
+  std::map<JitFnKey, void *>::iterator It;
+  {
+    //TimeTraceScope T("findMap");
+    It = JitCache.find(Key);
+  }
   if (It == JitCache.end()) {
+    //TimeTraceScope T("compileAndLink");
     JitFnPtr = Jit->compileAndLink(FnName, IR, RC, NumRuntimeConstants);
     JitCache[Key] = JitFnPtr;
     //dbgs() << "New Key " << Key << " inserting...\n";
@@ -485,9 +511,7 @@ void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
   else {
     //dbgs() << "Key " << Key << " found! cache hit\n";
     JitFnPtr = It->second;
-#ifdef KEEP_STATS
     hits++;
-#endif
   }
   //getchar();
 #endif
