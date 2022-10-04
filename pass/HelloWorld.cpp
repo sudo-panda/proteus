@@ -26,6 +26,11 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
+#include "llvm/Pass.h"
+#include "llvm/Analysis/CallGraph.h"
 
 #include <iostream>
 
@@ -38,8 +43,13 @@ using namespace llvm;
 // everything in an anonymous namespace.
 namespace {
 
-SmallVector<Function *, 8> JitFunctions;
-SmallVector<SmallVector<int, 8>, 8> ConstantArgsList;
+struct JitFunctionInfo {
+  Function *Fn;
+  SmallVector<int, 8> ConstantArgs;
+  std::string ModuleIR;
+};
+
+SmallVector<JitFunctionInfo, 8> JitFunctionInfoList;
 
 void parseAnnotations(Module &M) {
   auto GlobalAnnotations = M.getNamedGlobal("llvm.global.annotations");
@@ -65,39 +75,72 @@ void parseAnnotations(Module &M) {
       if (Annotation->getAsCString().compare("jit"))
         continue;
 
+      JitFunctionInfo JFI;
+      JFI.Fn = Fn;
+
       if (Entry->getOperand(4)->isNullValue())
-        ConstantArgsList.push_back({});
+        JFI.ConstantArgs = {};
       else {
         dbgs() << "AnnotArgs " << *Entry->getOperand(4)->getOperand(0) << "\n";
         dbgs() << "Type AnnotArgs " << *Entry->getOperand(4)->getOperand(0)->getType() << "\n";
         auto AnnotArgs =
             cast<ConstantStruct>(Entry->getOperand(4)->getOperand(0));
 
-        SmallVector<int, 8> ConstantArgs;
         for (int I = 0; I < AnnotArgs->getNumOperands(); ++I) {
           auto *Index = cast<ConstantInt>(AnnotArgs->getOperand(I));
           // TODO: think about types, check within function arguments bounds, -1
           // to convert to 0-start index.
-          ConstantArgs.push_back(Index->getValue().getZExtValue() - 1);
+          JFI.ConstantArgs.push_back(Index->getValue().getZExtValue() - 1);
         }
-        ConstantArgsList.push_back(std::move(ConstantArgs));
       }
 
-      JitFunctions.push_back(Fn);
+      JitFunctionInfoList.push_back(JFI);
+    }
+  }
+}
+
+void getReachableFunctions(Module &M, Function &F,
+                           SmallPtrSetImpl<Function *> &ReachableFunctions) {
+  SmallVector<Function *, 8> ToVisit;
+  ToVisit.push_back(&F);
+  CallGraphWrapperPass CG;
+  CG.runOnModule(M);
+  while (!ToVisit.empty()) {
+    Function *VisitF = ToVisit.pop_back_val();
+    CallGraphNode *CGNode = CG[VisitF];
+
+    for (const auto &Callee : *CGNode) {
+      Function *CalleeF = Callee.second->getFunction();
+
+      if (!CalleeF) {
+        dbgs() << "Skip external node\n";
+        continue;
+      }
+
+      if (CalleeF->isDeclaration()) {
+        dbgs() << "Skip declaration of " << CalleeF->getName() << "\n";
+        continue;
+      }
+
+      if (ReachableFunctions.contains(CalleeF)) {
+        dbgs() << "Skip already visited " << CalleeF->getName() << "\n";
+        continue;
+      }
+
+      dbgs() << "Found reachable " << CalleeF->getName() << " ... to visit\n";
+      ReachableFunctions.insert(CalleeF);
+      ToVisit.push_back(CalleeF);
     }
   }
 }
 
 // This method implements what the pass does
-void visitor(Module &M) {
+void visitor(Module &M, CallGraph &CG) {
 
-  if (JitFunctions.empty())
+  if (JitFunctionInfoList.empty())
     return;
 
-  dbgs() << "=== Starting M\n" << M << "=== End of Starting M\n";
-  // Clone the module to avoid jit stubs in other functions.
-  // TODO: maybe we want jit stubs?
-  auto OriginalM = CloneModule(M);
+  dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
 
   // Create jit entry runtime function.
   Type *VoidPtrTy = Type::getInt8PtrTy(M.getContext());
@@ -107,6 +150,10 @@ void visitor(Module &M) {
   StructType *RuntimeConstantTy =
       StructType::create({Int32Ty, Int64Ty}, "struct.args");
 
+  // TODO: This works by embedding the jit.bc library.
+  //Function *JitEntryFn = M.getFunction("__jit_entry");
+  //assert(JitEntryFn && "Expected non-null JitEntryFn");
+  //FunctionType *JitEntryFnTy = JitEntryFn->getFunctionType();
   FunctionType *JitEntryFnTy = FunctionType::get(
       VoidPtrTy,
       {VoidPtrTy, VoidPtrTy, RuntimeConstantTy->getPointerTo(), Int32Ty},
@@ -114,84 +161,39 @@ void visitor(Module &M) {
   Function *JitEntryFn = Function::Create(
       JitEntryFnTy, GlobalValue::ExternalLinkage, "__jit_entry", M);
 
-  int Idx = 0;
+  // First pass creates the string Module IR per jit'ed function.
+  for (JitFunctionInfo &JFI : JitFunctionInfoList) {
+    Function *F = JFI.Fn;
 
-  SmallVector<Function *, 8> FunctionsToBeDeleted;
-  for (Function *F : JitFunctions) {
-    dbgs() << "SIZE " << ConstantArgsList[Idx].size() << "\n";
-    // TODO: The current design copies over only the function and globals
-    // (constants are copied, others are extern'ed). It might be beneficial for
-    // optimization to copy the whole module excluding functions/globals that
-    // are not referenced by any of the jit-annotated functions. Whole module
-    // copying should happen only one per parent module.
-    auto JitMod = CloneModule(*OriginalM);
+    SmallPtrSet<Function *, 16> ReachableFunctions;
+    getReachableFunctions(M, *F, ReachableFunctions);
+    ReachableFunctions.insert(F);
 
-    Function *MainF = JitMod->getFunction("main");
-    if (MainF)
-      MainF->eraseFromParent();
-    // TODO: Do we want to strip debug info?
-    StripDebugInfo(*JitMod);
-    SmallVector<GlobalVariable *, 8> ToRemove, ToExtern;
-    for (auto &Global : JitMod->globals()) {
-      if (Global.isConstant())
-        continue;
-
-      // TODO: Do we want to remove llvm.metadata section'ed data?
-      if (Global.getSection() == "llvm.metadata") {
-        ToRemove.push_back(&Global);
-        continue;
-      }
-
-      ToExtern.push_back(&Global);
-    }
-
-    for(GlobalVariable *Global : ToExtern) {
-      StringRef Name = Global->getName();
-      // Remove name to avoid conflict with extern definition.
-      Global->setName("");
-      auto *GV = new GlobalVariable(
-          *JitMod, Global->getType(), /* isConstant */ false,
-          GlobalVariable::ExternalLinkage, nullptr, Name, nullptr,
-          Global->getThreadLocalMode(), Global->getAddressSpace(),
-          Global->isExternallyInitialized());
-      Global->replaceAllUsesWith(GV);
-      Global->eraseFromParent();
-    }
-
-    for(GlobalVariable *Global : ToRemove)
-      Global->eraseFromParent();
-
-    #if 0
-    auto JitMod = std::make_unique<Module>("jit", M.getContext());
-    Function *CloneF = Function::Create(F->getFunctionType(), F->getLinkage(),
-                                        F->getName() + ".clone", *JitMod);
     ValueToValueMapTy VMap;
-    // TODO: fill Returns?
-    SmallVector<ReturnInst *, 8> Returns;
-    CloneFunctionInto(CloneF, F, VMap, CloneFunctionChangeType::ClonedModule,
-                      Returns);
-    auto Attrs = CloneF->getAttributes();
+    auto JitMod = CloneModule(
+        M, VMap, [&ReachableFunctions](const GlobalValue *GV) {
+          dbgs() << "GV " << GV->getName() << "\n";
+          if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
+            if (!G->isConstant())
+              return false;
+          }
 
-    for (auto &Global : M.globals()) {
-      if (Global.getSection() == "llvm.metadata")
-        continue;
+          if (const Function *F = dyn_cast<Function>(GV)) {
+            if (!ReachableFunctions.contains(F)) {
+              dbgs() << "Drop unreachable " << F->getName() << "\n";
+              return false;
+            } else {
+              dbgs() << "Keep reachable " << F->getName() << "\n";
+            }
+            // getchar();
+          }
 
-      GlobalVariable *GV = new GlobalVariable(
-          *JitMod, Global.getValueType(), Global.isConstant(),
-          (Global.isConstant() ? Global.getLinkage()
-                               : GlobalVariable::ExternalLinkage),
-          Global.getInitializer(), Global.getName(), (GlobalVariable *)nullptr,
-          Global.getThreadLocalMode(), Global.getType()->getAddressSpace());
-      GV->copyAttributesFrom(&Global);
-      // VMap[&*I] = GV;
-      dbgs() << "Global " << Global << "\n";
-      getchar();
-    }
-    // Remove attributes, debug info and store IR in string.
-    for(auto &A : Attrs)
-      CloneF->removeFnAttrs(A);
+          // By default, clone the definition.
+          return true;
+        });
+
+    // TODO: Do we want to keep debug info?
     StripDebugInfo(*JitMod);
-    #endif
 
     if (verifyModule(*JitMod, &errs()))
       report_fatal_error("Broken module found, compilation aborted!", false);
@@ -199,81 +201,76 @@ void visitor(Module &M) {
       dbgs() << "JitMod verified!\n";
 
     // TODO: is saving the bitcode instead of the textual IR faster?
-    std::string StrIR;
-    raw_string_ostream OS(StrIR);
+    raw_string_ostream OS(JFI.ModuleIR);
     OS << *JitMod;
     OS.flush();
 
-    dbgs() << "=== StrIR\n" << StrIR << "=== End of StrIR\n";
+    dbgs() << "=== StrIR\n" << JFI.ModuleIR << "=== End of StrIR\n";
+    dbgs() << "=== Post M\n" << M << "=== End of Post M\n";
+  }
 
-    // Replace the body of F.
-    // TODO: is clear enough or should delete?
-    //F->getBasicBlockList().clear();
-
+  // Second pass replaces jit'ed functions in the original module with stubs to
+  // call the runtime entry point that compiles and links.
+  for (JitFunctionInfo &JFI : JitFunctionInfoList) {
+    Function *F = JFI.Fn;
+    // Replace jit'ed function with a stub function.
     StringRef FnName = F->getName();
     F->setName("");
-    Function *StubFn = Function::Create(
-        F->getFunctionType(), F->getLinkage(), FnName, M);
+    Function *StubFn =
+        Function::Create(F->getFunctionType(), F->getLinkage(), FnName, M);
     F->replaceAllUsesWith(StubFn);
-    FunctionsToBeDeleted.push_back(F);
+    F->eraseFromParent();
 
     // Replace the body of the jit'ed function to call the jit entry, grab the
     // address of the specialized jit version and execute it.
-    IRBuilder<> Builder(
-        BasicBlock::Create(M.getContext(), "entry", StubFn, &StubFn->getEntryBlock()));
-    // Create types for the runtime constant data structure and the jit entry
-    // function.
+    IRBuilder<> Builder(BasicBlock::Create(M.getContext(), "entry", StubFn,
+                                           &StubFn->getEntryBlock()));
 
+    // Create the runtime constant array type for the runtime constants passed
+    // to the jit entry function.
     ArrayType *RuntimeConstantArrayTy =
-        ArrayType::get(RuntimeConstantTy, ConstantArgsList[Idx].size());
+        ArrayType::get(RuntimeConstantTy, JFI.ConstantArgs.size());
 
     // Create globals for the function name and string IR passed to the jit
     // entry.
     auto *FnNameGlobal = Builder.CreateGlobalString(StubFn->getName());
-    auto *StrIRGlobal = Builder.CreateGlobalString(StrIR);
+    auto *StrIRGlobal = Builder.CreateGlobalString(JFI.ModuleIR);
 
     // Create the runtime constants data structure passed to the jit entry.
     auto *RuntimeConstantsAlloca = Builder.CreateAlloca(RuntimeConstantArrayTy);
     // Zero-initialize the alloca to avoid stack garbage for caching.
     Builder.CreateStore(Constant::getNullValue(RuntimeConstantArrayTy),
                         RuntimeConstantsAlloca);
-    for (int ArgI = 0; ArgI < ConstantArgsList[Idx].size(); ++ArgI) {
+    for (int ArgI = 0; ArgI < JFI.ConstantArgs.size(); ++ArgI) {
       auto *GEP = Builder.CreateInBoundsGEP(
           RuntimeConstantArrayTy, RuntimeConstantsAlloca,
           {Builder.getInt32(0), Builder.getInt32(ArgI)});
-      auto *GEPArgNo =
-          Builder.CreateStructGEP(RuntimeConstantTy, GEP, 0);
+      auto *GEPArgNo = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 0);
 
-      int ArgNo = ConstantArgsList[Idx][ArgI];
+      int ArgNo = JFI.ConstantArgs[ArgI];
       Builder.CreateStore(Builder.getInt32(ArgNo), GEPArgNo);
 
-      auto *GEPValue =
-          Builder.CreateStructGEP(RuntimeConstantTy, GEP, 1);
+      auto *GEPValue = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 1);
       Builder.CreateStore(StubFn->getArg(ArgNo), GEPValue);
     }
 
     auto *JitFnPtr =
         Builder.CreateCall(JitEntryFnTy, JitEntryFn,
                            {FnNameGlobal, StrIRGlobal, RuntimeConstantsAlloca,
-                            Builder.getInt32(ConstantArgsList[Idx].size())});
+                            Builder.getInt32(JFI.ConstantArgs.size())});
     SmallVector<Value *, 8> Args;
-    for(auto &Arg : StubFn->args())
+    for (auto &Arg : StubFn->args())
       Args.push_back(&Arg);
-    auto *RetVal = Builder.CreateCall(StubFn->getFunctionType(), JitFnPtr, Args);
+    auto *RetVal =
+        Builder.CreateCall(StubFn->getFunctionType(), JitFnPtr, Args);
     if (StubFn->getReturnType()->isVoidTy())
       Builder.CreateRetVoid();
     else
       Builder.CreateRet(RetVal);
 
-    dbgs() << "=== StubFn " << *StubFn << "=== End of StubFn\n";
-    getchar();
-    dbgs() << "=== Original Module\n" << M << "=== End of Original Module\n";
-
-    ++Idx;
+    // dbgs() << "=== StubFn " << *StubFn << "=== End of StubFn\n";
+    // getchar();
   }
-
-  //for(Function *F : FunctionsToBeDeleted)
-  //  F->eraseFromParent();
 
   if (verifyModule(M, &errs()))
     report_fatal_error("Broken module found, compilation aborted!", false);
@@ -285,9 +282,10 @@ void visitor(Module &M) {
 struct HelloWorld : PassInfoMixin<HelloWorld> {
   // Main entry point, takes IR unit to run the pass on (&F) and the
   // corresponding pass manager (to be queried if need be)
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     parseAnnotations(M);
-    visitor(M);
+    CallGraph &CG = AM.getResult<CallGraphAnalysis>(M);
+    visitor(M, CG);
     // TODO: is anything preserved?
     return PreservedAnalyses::none();
     //return PreservedAnalyses::all();
@@ -306,7 +304,8 @@ struct LegacyHelloWorld : public ModulePass {
   // Main entry point - the name conveys what unit of IR this is to be run on.
   bool runOnModule(Module &M) override {
     parseAnnotations(M);
-    visitor(M);
+    CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+    visitor(M, CG);
 
     // TODO: is anything preserved?
     return true;
@@ -326,7 +325,7 @@ llvm::PassPluginLibraryInfo getHelloWorldPluginInfo() {
     // optimization, hence overhead, at runtime.
     //PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM, auto) {
     PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
-    // XXX: LastEP can break jit'ing, functions is inlined!
+    // XXX: LastEP can break jit'ing, jit function is inlined!
     //PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
       MPM.addPass(HelloWorld());
       return true;
