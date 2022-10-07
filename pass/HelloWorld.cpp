@@ -140,26 +140,7 @@ void visitor(Module &M, CallGraph &CG) {
   if (JitFunctionInfoList.empty())
     return;
 
-  dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
-
-  // Create jit entry runtime function.
-  Type *VoidPtrTy = Type::getInt8PtrTy(M.getContext());
-  Type *Int32Ty = Type::getInt32Ty(M.getContext());
-  Type *Int64Ty = Type::getInt64Ty(M.getContext());
-  // Use Int64 type for the Value, big enough to hold primitives.
-  StructType *RuntimeConstantTy =
-      StructType::create({Int32Ty, Int64Ty}, "struct.args");
-
-  // TODO: This works by embedding the jit.bc library.
-  //Function *JitEntryFn = M.getFunction("__jit_entry");
-  //assert(JitEntryFn && "Expected non-null JitEntryFn");
-  //FunctionType *JitEntryFnTy = JitEntryFn->getFunctionType();
-  FunctionType *JitEntryFnTy = FunctionType::get(
-      VoidPtrTy,
-      {VoidPtrTy, VoidPtrTy, RuntimeConstantTy->getPointerTo(), Int32Ty},
-      /* isVarArg=*/false);
-  Function *JitEntryFn = Function::Create(
-      JitEntryFnTy, GlobalValue::ExternalLinkage, "__jit_entry", M);
+  //dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
 
   // First pass creates the string Module IR per jit'ed function.
   for (JitFunctionInfo &JFI : JitFunctionInfoList) {
@@ -172,18 +153,18 @@ void visitor(Module &M, CallGraph &CG) {
     ValueToValueMapTy VMap;
     auto JitMod = CloneModule(
         M, VMap, [&ReachableFunctions](const GlobalValue *GV) {
-          dbgs() << "GV " << GV->getName() << "\n";
           if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
             if (!G->isConstant())
               return false;
           }
 
           if (const Function *F = dyn_cast<Function>(GV)) {
+            // Do not keep definitions of unreachable functions.
             if (!ReachableFunctions.contains(F)) {
-              dbgs() << "Drop unreachable " << F->getName() << "\n";
+              //dbgs() << "Drop unreachable " << F->getName() << "\n";
               return false;
             } else {
-              dbgs() << "Keep reachable " << F->getName() << "\n";
+              //dbgs() << "Keep reachable " << F->getName() << "\n";
             }
             // getchar();
           }
@@ -192,6 +173,8 @@ void visitor(Module &M, CallGraph &CG) {
           return true;
         });
 
+    Function *JitF = cast<Function>(VMap[F]);
+    JitF->setLinkage(GlobalValue::ExternalLinkage);
     // TODO: Do we want to keep debug info?
     StripDebugInfo(*JitMod);
 
@@ -206,13 +189,33 @@ void visitor(Module &M, CallGraph &CG) {
     OS.flush();
 
     dbgs() << "=== StrIR\n" << JFI.ModuleIR << "=== End of StrIR\n";
-    dbgs() << "=== Post M\n" << M << "=== End of Post M\n";
+    //dbgs() << "=== Post M\n" << M << "=== End of Post M\n";
   }
+
+  // Create jit entry runtime function.
+  Type *VoidPtrTy = Type::getInt8PtrTy(M.getContext());
+  Type *Int32Ty = Type::getInt32Ty(M.getContext());
+  Type *Int64Ty = Type::getInt64Ty(M.getContext());
+  // Use Int64 type for the Value, big enough to hold primitives.
+  StructType *RuntimeConstantTy =
+      StructType::create({Int32Ty, Int64Ty}, "struct.args");
+
+  // TODO: This works by embedding the jit.bc library.
+  // Function *JitEntryFn = M.getFunction("__jit_entry");
+  // assert(JitEntryFn && "Expected non-null JitEntryFn");
+  // FunctionType *JitEntryFnTy = JitEntryFn->getFunctionType();
+  FunctionType *JitEntryFnTy = FunctionType::get(
+      VoidPtrTy,
+      {VoidPtrTy, VoidPtrTy, RuntimeConstantTy->getPointerTo(), Int32Ty},
+      /* isVarArg=*/false);
+  Function *JitEntryFn = Function::Create(
+      JitEntryFnTy, GlobalValue::ExternalLinkage, "__jit_entry", M);
 
   // Second pass replaces jit'ed functions in the original module with stubs to
   // call the runtime entry point that compiles and links.
   for (JitFunctionInfo &JFI : JitFunctionInfoList) {
     Function *F = JFI.Fn;
+
     // Replace jit'ed function with a stub function.
     StringRef FnName = F->getName();
     F->setName("");
@@ -223,8 +226,7 @@ void visitor(Module &M, CallGraph &CG) {
 
     // Replace the body of the jit'ed function to call the jit entry, grab the
     // address of the specialized jit version and execute it.
-    IRBuilder<> Builder(BasicBlock::Create(M.getContext(), "entry", StubFn,
-                                           &StubFn->getEntryBlock()));
+    IRBuilder<> Builder(BasicBlock::Create(M.getContext(), "entry", StubFn));
 
     // Create the runtime constant array type for the runtime constants passed
     // to the jit entry function.
@@ -324,9 +326,9 @@ llvm::PassPluginLibraryInfo getHelloWorldPluginInfo() {
     // inlining jit function (which disables jit'ing) but may require more
     // optimization, hence overhead, at runtime.
     //PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM, auto) {
-    PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
+    //PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
     // XXX: LastEP can break jit'ing, jit function is inlined!
-    //PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
+    PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
       MPM.addPass(HelloWorld());
       return true;
     });
