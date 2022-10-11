@@ -1,19 +1,21 @@
 //=============================================================================
 // FILE:
-//    HelloWorld.cpp
+//    JitPass.cpp
 //
 // DESCRIPTION:
-//    Visits all functions in a module, prints their names and the number of
-//    arguments via stderr. Strictly speaking, this is an analysis pass (i.e.
-//    the functions are not modified). However, in order to keep things simple
-//    there's no 'print' method here (every analysis pass should implement it).
+//    Find functions annotated with "jit" plus input arguments that are
+//    amenable to runtime constant propagation. Stores the IR for those
+//    functions, replaces them with a stub function that calls the jit runtime
+//    library to compile the IR and call the function pointer of the jit'ed
+//    version.
 //
 // USAGE:
 //    1. Legacy PM
-//      opt -enable-new-pm=0 -load libHelloWorld.dylib -legacy-hello-world -disable-output `\`
+//      opt -enable-new-pm=0 -load libJitPass.dylib -legacy-jit-pass
+//      -disable-output `\`
 //        <input-llvm-file>
 //    2. New PM
-//      opt -load-pass-plugin=libHelloWorld.dylib -passes="hello-world" `\`
+//      opt -load-pass-plugin=libJitPass.dylib -passes="jit-pass" `\`
 //        -disable-output <input-llvm-file>
 //
 //
@@ -37,7 +39,7 @@
 using namespace llvm;
 
 //-----------------------------------------------------------------------------
-// HelloWorld implementation
+// JitPass implementation
 //-----------------------------------------------------------------------------
 // No need to expose the internals of the pass to the outside world - keep
 // everything in an anonymous namespace.
@@ -137,8 +139,10 @@ void getReachableFunctions(Module &M, Function &F,
 // This method implements what the pass does
 void visitor(Module &M, CallGraph &CG) {
 
-  if (JitFunctionInfoList.empty())
+  if (JitFunctionInfoList.empty()) {
+    //dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
     return;
+  }
 
   //dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
 
@@ -183,7 +187,7 @@ void visitor(Module &M, CallGraph &CG) {
     else
       dbgs() << "JitMod verified!\n";
 
-    // TODO: is saving the bitcode instead of the textual IR faster?
+    // TODO: is writing/reading the bitcode instead of the textual IR faster?
     raw_string_ostream OS(JFI.ModuleIR);
     OS << *JitMod;
     OS.flush();
@@ -274,6 +278,7 @@ void visitor(Module &M, CallGraph &CG) {
     // getchar();
   }
 
+  dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
   if (verifyModule(M, &errs()))
     report_fatal_error("Broken module found, compilation aborted!", false);
   else
@@ -281,7 +286,7 @@ void visitor(Module &M, CallGraph &CG) {
 }
 
 // New PM implementation
-struct HelloWorld : PassInfoMixin<HelloWorld> {
+struct JitPass : PassInfoMixin<JitPass> {
   // Main entry point, takes IR unit to run the pass on (&F) and the
   // corresponding pass manager (to be queried if need be)
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
@@ -300,16 +305,16 @@ struct HelloWorld : PassInfoMixin<HelloWorld> {
 };
 
 // Legacy PM implementation
-struct LegacyHelloWorld : public ModulePass {
+struct LegacyJitPass : public ModulePass {
   static char ID;
-  LegacyHelloWorld() : ModulePass(ID) {}
+  LegacyJitPass() : ModulePass(ID) {}
   // Main entry point - the name conveys what unit of IR this is to be run on.
   bool runOnModule(Module &M) override {
     parseAnnotations(M);
     CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
     visitor(M, CG);
 
-    // TODO: is anything preserved?
+    // TODO: what is preserved?
     return true;
     // Doesn't modify the input unit of IR, hence 'false'
     //return false;
@@ -320,7 +325,7 @@ struct LegacyHelloWorld : public ModulePass {
 //-----------------------------------------------------------------------------
 // New PM Registration
 //-----------------------------------------------------------------------------
-llvm::PassPluginLibraryInfo getHelloWorldPluginInfo() {
+llvm::PassPluginLibraryInfo getJitPassPluginInfo() {
   const auto callback = [](PassBuilder &PB) {
     // TODO: decide where to insert it in the pipeline. Early avoids
     // inlining jit function (which disables jit'ing) but may require more
@@ -329,20 +334,21 @@ llvm::PassPluginLibraryInfo getHelloWorldPluginInfo() {
     //PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
     // XXX: LastEP can break jit'ing, jit function is inlined!
     PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
-      MPM.addPass(HelloWorld());
+      MPM.addPass(JitPass());
       return true;
     });
   };
 
-  return {LLVM_PLUGIN_API_VERSION, "HelloWorld", LLVM_VERSION_STRING, callback};
+  return {LLVM_PLUGIN_API_VERSION, "JitPass", LLVM_VERSION_STRING, callback};
 }
 
+// TODO: use by jit-pass name.
 // This is the core interface for pass plugins. It guarantees that 'opt' will
-// be able to recognize HelloWorld when added to the pass pipeline on the
-// command line, i.e. via '-passes=hello-world'
+// be able to recognize JitPass when added to the pass pipeline on the
+// command line, i.e. via '-passes=jit-pass'
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
-  return getHelloWorldPluginInfo();
+  return getJitPassPluginInfo();
 }
 
 //-----------------------------------------------------------------------------
@@ -350,13 +356,13 @@ llvmGetPassPluginInfo() {
 //-----------------------------------------------------------------------------
 // The address of this variable is used to uniquely identify the pass. The
 // actual value doesn't matter.
-char LegacyHelloWorld::ID = 0;
+char LegacyJitPass::ID = 0;
 
 // This is the core interface for pass plugins. It guarantees that 'opt' will
-// recognize LegacyHelloWorld when added to the pass pipeline on the command
-// line, i.e.  via '--legacy-hello-world'
-static RegisterPass<LegacyHelloWorld>
-    X("legacy-hello-world", "Hello World Pass",
-      true, // This pass doesn't modify the CFG => true
+// recognize LegacyJitPass when added to the pass pipeline on the command
+// line, i.e.  via '--legacy-jit-pass'
+static RegisterPass<LegacyJitPass>
+    X("legacy-jit-pass", "Jit Pass",
+      false, // This pass doesn't modify the CFG => false
       false // This pass is not a pure analysis pass => false
     );

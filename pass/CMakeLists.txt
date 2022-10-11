@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13.4)
-project(llvm-tutor-hello-world)
+project(llvm-jit-pass)
 
 #===============================================================================
 # 1. LOAD LLVM CONFIGURATION
@@ -14,7 +14,7 @@ list(APPEND CMAKE_PREFIX_PATH "${LT_LLVM_INSTALL_DIR}/lib/cmake/llvm/")
 # FIXME: This is a warkaround for #25. Remove once resolved and use
 find_package(LLVM 15 REQUIRED CONFIG)
 
-# HelloWorld includes headers from LLVM - update the include paths accordingly
+# JitPass includes headers from LLVM - update the include paths accordingly
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 
 #===============================================================================
@@ -31,9 +31,9 @@ endif()
 #===============================================================================
 # 3. ADD THE TARGET
 #===============================================================================
-add_library(HelloWorld SHARED HelloWorld.cpp)
+add_library(JitPass SHARED JitPass.cpp)
 
 # Allow undefined symbols in shared objects on Darwin (this is the default
 # behaviour on Linux)
-target_link_libraries(HelloWorld
+target_link_libraries(JitPass
   "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
