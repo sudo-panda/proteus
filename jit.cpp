@@ -45,6 +45,7 @@
 #include "llvm/Transforms/Vectorize.h"
 
 #include <unordered_map>
+#include <iostream>
 
 #define ENABLE_TIME_PROFILING
 
@@ -207,8 +208,15 @@ public:
 
   ExitOnError ExitOnErr;
 
-  JitEngine(int argc, char *argv[])
-    {
+  struct JitCacheEntry {
+    void *Ptr;
+    int num_execs;
+  };
+  std::unordered_map<std::string, JitCacheEntry> JitCache;
+  int hits = 0;
+  int total = 0;
+
+  JitEngine(int argc, char *argv[]) {
     InitLLVM X(argc, argv);
 
     InitializeNativeTarget();
@@ -232,6 +240,16 @@ public:
 
     //dbgs() << "JIT inited\n";
     //getchar();
+  }
+
+  ~JitEngine() {
+    std::cout << "JitCache hits " << hits << " total " << total << "\n";
+    for (auto &It : JitCache) {
+      StringRef FnName = It.first;
+      JitCacheEntry &JCE = It.second;
+      std::cout << "FnName " << FnName.str() << " num_execs " << JCE.num_execs
+                << "\n";
+    }
   }
 
   Expected<llvm::orc::ThreadSafeModule>
@@ -325,18 +343,27 @@ public:
 
   void *compileAndLink(StringRef FnName, StringRef IR, RuntimeConstant *RC,
                       int NumRuntimeConstants) {
-    dbgs() << "======= COMPILING " << FnName << " =====================\n";
+    TIMESCOPE("compileAndLink");
     std::string Suffix = mangleSuffix(FnName, RC, NumRuntimeConstants);
     std::string MangledFnName = FnName.str() + Suffix;
+
+    void *JitFnPtr = lookup(MangledFnName);
+    if (JitFnPtr)
+      return JitFnPtr;
+
+    dbgs() << "======= COMPILING " << FnName << " =====================\n";
     // (3) Add modules.
     ExitOnErr(J->addIRModule(
         ExitOnErr(parseSource(FnName, Suffix, IR, RC, NumRuntimeConstants))));
 
-    // (4) Look up the JIT'd function and call it.
+    // (4) Look up the JIT'd function.
     //dbgs() << "Lookup FnName " << FnName << "\n";
     auto EntryAddr = ExitOnErr(J->lookup(MangledFnName));
 
-    return (void *)EntryAddr.getValue();
+    JitFnPtr = (void *)EntryAddr.getValue();
+    insert(MangledFnName, JitFnPtr);
+
+    return JitFnPtr;
   }
 
   std::string mangleSuffix(StringRef FnName, RuntimeConstant *RC,
@@ -348,26 +375,27 @@ public:
     return Suffix;
   }
 
-  void *lookup(StringRef FnName, RuntimeConstant *RC, int NumRuntimeConstants) {
-    std::string Suffix = mangleSuffix(FnName, RC, NumRuntimeConstants);
-    std::string MangledFnName = FnName.str() + Suffix;
-    auto EntryAddr = J->lookup(MangledFnName);
+  void *lookup(StringRef FnName) {
+    TIMESCOPE("lookup");
+    total++;
 
-    if (errorToBool(EntryAddr.takeError()))
+    auto It = JitCache.find(FnName.str());
+    if (It == JitCache.end())
       return nullptr;
 
-    return (void *)EntryAddr->getValue();
+    It->second.num_execs++;
+    hits++;
+    return It->second.Ptr;
+  }
+
+  void insert(StringRef FnName, void *Ptr) {
+    TIMESCOPE("insert");
+    JitCache[FnName.str()] = {Ptr, /* num_execs */ 1};
   }
 };
 
 JitEngine Jit(0, (char *[]){ nullptr });
 
-int hits = 0;
-int total = 0;
-
-//std::unordered_map<Key, void *> JitCache;
-//std::unordered_map<std::string, std::pair<void *, int>> JitCache;
-std::unordered_map<std::string, std::pair<void *, int>> JitCache;
 extern "C" {
 __attribute__((used))
 void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
@@ -384,28 +412,8 @@ void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
            << "\n";
 #endif
 
-  total++;
-  void *JitFnPtr = nullptr;
-  std::string MangledFnName = std::string(FnName) + Jit.mangleSuffix(FnName, RC, NumRuntimeConstants);
-  {
-    TIMESCOPE("findSymbol");
-    auto It = JitCache.find(MangledFnName);
-    //dbgs() << "Lookup for " << MangledFnName << "\n";
-    if (It != JitCache.end()) {
-      //dbgs() << "Found " << It->first << " addr " << It->second.first
-      //       << " execs " << It->second.second << "\n";
-      JitFnPtr = It->second.first;
-      It->second.second++;
-    }
-  }
-  if (!JitFnPtr) {
-    TIMESCOPE("compileAndLink");
-    JitFnPtr = Jit.compileAndLink(FnName, IR, RC, NumRuntimeConstants);
-    JitCache[MangledFnName] = std::make_pair(JitFnPtr, 0);
-    //dbgs() << "Insert " << MangledFnName << " addr " << JitFnPtr << "\n";
-  }
-  else
-    hits++;
+  //dbgs() << "Compile and link " << MangledFnName << "\n";
+  void *JitFnPtr = Jit.compileAndLink(FnName, IR, RC, NumRuntimeConstants);
 
   return JitFnPtr;
 }
