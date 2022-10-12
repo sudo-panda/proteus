@@ -67,6 +67,11 @@ void parseAnnotations(Module &M) {
       if (!Fn)
         continue;
 
+      for (auto &JFI : JitFunctionInfoList)
+        if (JFI.Fn == Fn)
+          report_fatal_error("Duplicate jit annotation for Fn " + Fn->getName(),
+                             false);
+
       dbgs() << "Function " << Fn->getName() << "\n";
 
       auto Annotation = cast<ConstantDataArray>(Entry->getOperand(1)->getOperand(0));
@@ -156,20 +161,33 @@ void visitor(Module &M, CallGraph &CG) {
 
     ValueToValueMapTy VMap;
     auto JitMod = CloneModule(
-        M, VMap, [&ReachableFunctions](const GlobalValue *GV) {
+        M, VMap, [&ReachableFunctions,&F](const GlobalValue *GV) {
           if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
             if (!G->isConstant())
               return false;
           }
 
-          if (const Function *F = dyn_cast<Function>(GV)) {
+          if (const Function *OrigF = dyn_cast<Function>(GV)) {
+            if (OrigF == F) {
+              dbgs() << "OrigF " << OrigF->getName() << " == " << F->getName() << ", definitely keep\n";
+              return true;
+            }
             // Do not keep definitions of unreachable functions.
-            if (!ReachableFunctions.contains(F)) {
+            if (!ReachableFunctions.contains(OrigF)) {
               //dbgs() << "Drop unreachable " << F->getName() << "\n";
               return false;
-            } else {
-              //dbgs() << "Keep reachable " << F->getName() << "\n";
             }
+
+#if 0
+            // Enable recursive jit'ing.
+            for (auto &JFIInner : JitFunctionInfoList)
+              if (JFIInner.Fn == OrigF) {
+                dbgs() << "Do not keep definitions of another jit function " << OrigF->getName() << "\n";
+                return false;
+              }
+#endif
+
+            // dbgs() << "Keep reachable " << F->getName() << "\n";
             // getchar();
           }
 
@@ -179,6 +197,17 @@ void visitor(Module &M, CallGraph &CG) {
 
     Function *JitF = cast<Function>(VMap[F]);
     JitF->setLinkage(GlobalValue::ExternalLinkage);
+#if 0
+    // Set linkage to external for any reachable jit'ed function to enable
+    // recursive jit'ing.
+    for (auto &JFIInner : JitFunctionInfoList) {
+      if (!ReachableFunctions.contains(JFIInner.Fn))
+        continue;
+      Function *JitF = cast<Function>(VMap[JFIInner.Fn]);
+      JitF->setLinkage(GlobalValue::ExternalLinkage);
+    }
+    F->setLinkage(GlobalValue::ExternalLinkage);
+#endif
     // TODO: Do we want to keep debug info?
     StripDebugInfo(*JitMod);
 
