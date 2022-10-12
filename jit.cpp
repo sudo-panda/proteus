@@ -118,6 +118,7 @@ public:
 #if 0
       dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
 #endif
+      TIMESCOPE("OptimizationTransform");
       Triple ModuleTriple(M.getTargetTriple());
       std::string CPUStr, FeaturesStr;
       TargetMachine *Machine = nullptr;
@@ -130,8 +131,8 @@ public:
         Machine = GetTargetMachine(ModuleTriple, CPUStr, FeaturesStr, Options);
       } else if (ModuleTriple.getArchName() != "unknown" &&
                  ModuleTriple.getArchName() != "") {
-        errs() << "unrecognized architecture '"
-               << ModuleTriple.getArchName() << "' provided.\n";
+        errs() << "unrecognized architecture '" << ModuleTriple.getArchName()
+               << "' provided.\n";
         abort();
       }
       std::unique_ptr<TargetMachine> TM(Machine);
@@ -307,8 +308,8 @@ public:
         if (&F == NewF)
           continue;
 
-#if 0
-        // TODO: is this needed?
+#if 1
+        // TODO: keep this, needed if injecting pass before inlining?
         // Workaround to make sure linkonce_odr symbols stay in the IR to avoid
         // materialization errors. Linkonce_odr symbols are converted to
         // external but with always_inline to optimize.
@@ -318,11 +319,9 @@ public:
           // TODO: InlineHint or AlwaysInline?
           F.addFnAttr(Attribute::InlineHint);
           F.setLinkage(GlobalValue::ExternalLinkage);
-          //F.setLinkage(GlobalValue::InternalLinkage);
         }
 #endif
-        // dbgs() << "Rename F " << F.getName() << " -> " << F.getName() +
-        // Suffix;
+        // Rename functions to internalize using jit'ed function name.
         F.setName(F.getName() + ".." + NewF->getName());
       }
 
