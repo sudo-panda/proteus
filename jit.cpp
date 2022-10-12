@@ -44,7 +44,6 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Vectorize.h"
 
-#include <unordered_map>
 #include <iostream>
 
 #define ENABLE_TIME_PROFILING
@@ -118,6 +117,7 @@ public:
 #if 0
       dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
 #endif
+      return;
       TIMESCOPE("OptimizationTransform");
       Triple ModuleTriple(M.getTargetTriple());
       std::string CPUStr, FeaturesStr;
@@ -213,7 +213,7 @@ public:
     void *Ptr;
     int num_execs;
   };
-  std::unordered_map<std::string, JitCacheEntry> JitCache;
+  StringMap<JitCacheEntry> JitCache;
   int hits = 0;
   int total = 0;
 
@@ -246,8 +246,8 @@ public:
   ~JitEngine() {
     std::cout << "JitCache hits " << hits << " total " << total << "\n";
     for (auto &It : JitCache) {
-      StringRef FnName = It.first;
-      JitCacheEntry &JCE = It.second;
+      StringRef FnName = It.getKey();
+      JitCacheEntry &JCE = It.getValue();
       std::cout << "FnName " << FnName.str() << " num_execs " << JCE.num_execs
                 << "\n";
     }
@@ -382,9 +382,9 @@ public:
     if (It == JitCache.end())
       return nullptr;
 
-    It->second.num_execs++;
+    It->getValue().num_execs++;
     hits++;
-    return It->second.Ptr;
+    return It->getValue().Ptr;
   }
 
   void insert(StringRef FnName, void *Ptr) {
