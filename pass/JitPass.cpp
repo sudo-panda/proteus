@@ -36,6 +36,8 @@
 
 #include <iostream>
 
+//#define ENABLE_RECURSIVE_JIT
+
 using namespace llvm;
 
 //-----------------------------------------------------------------------------
@@ -167,6 +169,10 @@ void visitor(Module &M, CallGraph &CG) {
               return false;
           }
 
+          // TODO: do not clone aliases' definitions, it this sound?
+          if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(GV))
+            return false;
+
           if (const Function *OrigF = dyn_cast<Function>(GV)) {
             if (OrigF == F) {
               dbgs() << "OrigF " << OrigF->getName() << " == " << F->getName() << ", definitely keep\n";
@@ -178,7 +184,7 @@ void visitor(Module &M, CallGraph &CG) {
               return false;
             }
 
-#if 0
+#ifdef ENABLE_RECURSIVE_JIT
             // Enable recursive jit'ing.
             for (auto &JFIInner : JitFunctionInfoList)
               if (JFIInner.Fn == OrigF) {
@@ -197,7 +203,31 @@ void visitor(Module &M, CallGraph &CG) {
 
     Function *JitF = cast<Function>(VMap[F]);
     JitF->setLinkage(GlobalValue::ExternalLinkage);
-#if 0
+
+    // Set global variables to external linkage when they are not constant or
+    // llvm intrinsics.
+    for (auto &GV : M.global_values()) {
+      if (VMap[&GV])
+        if (auto *GVar = dyn_cast<GlobalVariable>(&GV)) {
+          if (GVar->isConstant())
+            continue;
+          if (GVar->getSection() == "llvm.metadata")
+            continue;
+          if (GVar->getName() == "llvm.global_ctors")
+            continue;
+          if (GVar->isDSOLocal())
+            continue;
+          GV.setLinkage(GlobalValue::ExternalLinkage);
+          //dbgs() << "=== GV\n";
+          //dbgs() << GV << "\n";
+          //dbgs() << "Linkage " << GV.getLinkage() << "\n";
+          //dbgs() << "Visibility " << GV.getVisibility() << "\n";
+          //dbgs() << "Make " << GV << " External\n";
+          //dbgs() << "=== End GV\n";
+          //getchar();
+        }
+    }
+#ifdef ENABLE_RECURSIVE_JIT
     // Set linkage to external for any reachable jit'ed function to enable
     // recursive jit'ing.
     for (auto &JFIInner : JitFunctionInfoList) {
@@ -250,7 +280,7 @@ void visitor(Module &M, CallGraph &CG) {
     Function *F = JFI.Fn;
 
     // Replace jit'ed function with a stub function.
-    StringRef FnName = F->getName();
+    std::string FnName = F->getName().str();
     F->setName("");
     Function *StubFn =
         Function::Create(F->getFunctionType(), F->getLinkage(), FnName, M);
@@ -307,7 +337,7 @@ void visitor(Module &M, CallGraph &CG) {
     // getchar();
   }
 
-  dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
+  //dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
   if (verifyModule(M, &errs()))
     report_fatal_error("Broken module found, compilation aborted!", false);
   else
@@ -360,9 +390,9 @@ llvm::PassPluginLibraryInfo getJitPassPluginInfo() {
     // inlining jit function (which disables jit'ing) but may require more
     // optimization, hence overhead, at runtime.
     //PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM, auto) {
-    //PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
+    PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
     // XXX: LastEP can break jit'ing, jit function is inlined!
-    PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
+    //PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
       MPM.addPass(JitPass());
       return true;
     });
