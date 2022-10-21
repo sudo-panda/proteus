@@ -204,8 +204,7 @@ void visitor(Module &M, CallGraph &CG) {
     Function *JitF = cast<Function>(VMap[F]);
     JitF->setLinkage(GlobalValue::ExternalLinkage);
 
-    // Set global variables to external linkage when they are not constant or
-    // llvm intrinsics.
+    // Set global variables to external linkage, when needed.
     for (auto &GV : M.global_values()) {
       if (VMap[&GV])
         if (auto *GVar = dyn_cast<GlobalVariable>(&GV)) {
@@ -217,14 +216,16 @@ void visitor(Module &M, CallGraph &CG) {
             continue;
           if (GVar->isDSOLocal())
             continue;
-          GV.setLinkage(GlobalValue::ExternalLinkage);
+          if (GVar->hasCommonLinkage())
+            continue;
           //dbgs() << "=== GV\n";
           //dbgs() << GV << "\n";
           //dbgs() << "Linkage " << GV.getLinkage() << "\n";
           //dbgs() << "Visibility " << GV.getVisibility() << "\n";
+          GV.setLinkage(GlobalValue::ExternalLinkage);
           //dbgs() << "Make " << GV << " External\n";
+          //dbgs() << GV << "\n";
           //dbgs() << "=== End GV\n";
-          //getchar();
         }
     }
 #ifdef ENABLE_RECURSIVE_JIT
