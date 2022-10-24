@@ -117,7 +117,6 @@ public:
 #if 0
       dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
 #endif
-      return;
       TIMESCOPE("OptimizationTransform");
       Triple ModuleTriple(M.getTargetTriple());
       std::string CPUStr, FeaturesStr;
