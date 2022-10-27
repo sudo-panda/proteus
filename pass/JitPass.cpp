@@ -401,9 +401,9 @@ llvm::PassPluginLibraryInfo getJitPassPluginInfo() {
     // inlining jit function (which disables jit'ing) but may require more
     // optimization, hence overhead, at runtime.
     //PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM, auto) {
-    //PB.registerPipelineEarlySimplificationEPCallback([&](ModulePassManager &MPM, auto) {
+    PB.registerPipelineEarlySimplificationEPCallback([&](ModulePassManager &MPM, auto) {
     // XXX: LastEP can break jit'ing, jit function is inlined!
-    PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
+    //PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
       MPM.addPass(JitPass());
       return true;
     });
