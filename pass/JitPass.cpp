@@ -33,6 +33,7 @@
 #include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
 #include "llvm/Pass.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 
 #include <iostream>
 
@@ -147,7 +148,7 @@ void getReachableFunctions(Module &M, Function &F,
 void visitor(Module &M, CallGraph &CG) {
 
   if (JitFunctionInfoList.empty()) {
-    //dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
+    //dbgs() << "=== Empty Begin Mod\n" << M << "=== End Mod\n";
     return;
   }
 
@@ -249,10 +250,10 @@ void visitor(Module &M, CallGraph &CG) {
 
     // TODO: is writing/reading the bitcode instead of the textual IR faster?
     raw_string_ostream OS(JFI.ModuleIR);
-    OS << *JitMod;
+    WriteBitcodeToFile(*JitMod, OS);
     OS.flush();
 
-    dbgs() << "=== StrIR\n" << JFI.ModuleIR << "=== End of StrIR\n";
+    dbgs() << "=== StrIR\n" << *JitMod << "=== End of StrIR\n";
     //dbgs() << "=== Post M\n" << M << "=== End of Post M\n";
   }
 
@@ -268,10 +269,11 @@ void visitor(Module &M, CallGraph &CG) {
   // Function *JitEntryFn = M.getFunction("__jit_entry");
   // assert(JitEntryFn && "Expected non-null JitEntryFn");
   // FunctionType *JitEntryFnTy = JitEntryFn->getFunctionType();
-  FunctionType *JitEntryFnTy = FunctionType::get(
-      VoidPtrTy,
-      {VoidPtrTy, VoidPtrTy, RuntimeConstantTy->getPointerTo(), Int32Ty},
-      /* isVarArg=*/false);
+  FunctionType *JitEntryFnTy =
+      FunctionType::get(VoidPtrTy,
+                        {VoidPtrTy, VoidPtrTy, Int32Ty,
+                         RuntimeConstantTy->getPointerTo(), Int32Ty},
+                        /* isVarArg=*/false);
   Function *JitEntryFn = Function::Create(
       JitEntryFnTy, GlobalValue::ExternalLinkage, "__jit_entry", M);
 
@@ -303,27 +305,35 @@ void visitor(Module &M, CallGraph &CG) {
     auto *StrIRGlobal = Builder.CreateGlobalString(JFI.ModuleIR);
 
     // Create the runtime constants data structure passed to the jit entry.
-    auto *RuntimeConstantsAlloca = Builder.CreateAlloca(RuntimeConstantArrayTy);
-    // Zero-initialize the alloca to avoid stack garbage for caching.
-    Builder.CreateStore(Constant::getNullValue(RuntimeConstantArrayTy),
-                        RuntimeConstantsAlloca);
-    for (int ArgI = 0; ArgI < JFI.ConstantArgs.size(); ++ArgI) {
-      auto *GEP = Builder.CreateInBoundsGEP(
-          RuntimeConstantArrayTy, RuntimeConstantsAlloca,
-          {Builder.getInt32(0), Builder.getInt32(ArgI)});
-      auto *GEPArgNo = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 0);
+    Value *RuntimeConstantsAlloca = nullptr;
+    if (JFI.ConstantArgs.size() > 0) {
+      RuntimeConstantsAlloca = Builder.CreateAlloca(RuntimeConstantArrayTy);
+      // Zero-initialize the alloca to avoid stack garbage for caching.
+      Builder.CreateStore(Constant::getNullValue(RuntimeConstantArrayTy),
+                          RuntimeConstantsAlloca);
+      for (int ArgI = 0; ArgI < JFI.ConstantArgs.size(); ++ArgI) {
+        auto *GEP = Builder.CreateInBoundsGEP(
+            RuntimeConstantArrayTy, RuntimeConstantsAlloca,
+            {Builder.getInt32(0), Builder.getInt32(ArgI)});
+        auto *GEPArgNo = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 0);
 
-      int ArgNo = JFI.ConstantArgs[ArgI];
-      Builder.CreateStore(Builder.getInt32(ArgNo), GEPArgNo);
+        int ArgNo = JFI.ConstantArgs[ArgI];
+        Builder.CreateStore(Builder.getInt32(ArgNo), GEPArgNo);
 
-      auto *GEPValue = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 1);
-      Builder.CreateStore(StubFn->getArg(ArgNo), GEPValue);
+        auto *GEPValue = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 1);
+        Builder.CreateStore(StubFn->getArg(ArgNo), GEPValue);
+      }
     }
+    else
+      RuntimeConstantsAlloca =
+          Constant::getNullValue(RuntimeConstantArrayTy->getPointerTo());
 
-    auto *JitFnPtr =
-        Builder.CreateCall(JitEntryFnTy, JitEntryFn,
-                           {FnNameGlobal, StrIRGlobal, RuntimeConstantsAlloca,
-                            Builder.getInt32(JFI.ConstantArgs.size())});
+    assert(RuntimeConstantsAlloca && "Expected non-null runtime constants alloca");
+
+    auto *JitFnPtr = Builder.CreateCall(
+        JitEntryFnTy, JitEntryFn,
+        {FnNameGlobal, StrIRGlobal, Builder.getInt32(JFI.ModuleIR.size()),
+         RuntimeConstantsAlloca, Builder.getInt32(JFI.ConstantArgs.size())});
     SmallVector<Value *, 8> Args;
     for (auto &Arg : StubFn->args())
       Args.push_back(&Arg);
@@ -391,9 +401,9 @@ llvm::PassPluginLibraryInfo getJitPassPluginInfo() {
     // inlining jit function (which disables jit'ing) but may require more
     // optimization, hence overhead, at runtime.
     //PB.registerPipelineStartEPCallback([&](ModulePassManager &MPM, auto) {
-    PB.registerPipelineEarlySimplificationEPCallback( [&](ModulePassManager &MPM, auto) {
+    //PB.registerPipelineEarlySimplificationEPCallback([&](ModulePassManager &MPM, auto) {
     // XXX: LastEP can break jit'ing, jit function is inlined!
-    //PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
+    PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM, auto) {
       MPM.addPass(JitPass());
       return true;
     });

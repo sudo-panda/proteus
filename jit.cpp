@@ -259,7 +259,8 @@ public:
     TIMESCOPE("parseSource");
     auto Ctx = std::make_unique<LLVMContext>();
     SMDiagnostic Err;
-    if (auto M = parseIR(MemoryBufferRef(IR, "Mod"), Err, *Ctx)) {
+    if (auto M =
+            parseIR(MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()), Err, *Ctx)) {
       //dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n";
       Function *F = M->getFunction(FnName);
 
@@ -307,19 +308,8 @@ public:
         if (&F == NewF)
           continue;
 
-#if 1
-        // TODO: keep this, needed if injecting pass before inlining?
-        // Workaround to make sure linkonce_odr symbols stay in the IR to avoid
-        // materialization errors. Linkonce_odr symbols are converted to
-        // external but with always_inline to optimize.
-        // TODO: discard the materialization responsibility of all symbols but
-        // the jit function.
-        if (F.hasLinkOnceODRLinkage()) {
-          // TODO: InlineHint or AlwaysInline?
-          F.addFnAttr(Attribute::InlineHint);
-          F.setLinkage(GlobalValue::ExternalLinkage);
-        }
-#endif
+        // Internalize other functions in the module.
+        F.setLinkage(GlobalValue::InternalLinkage);
         // Rename functions to internalize using jit'ed function name.
         F.setName(F.getName() + ".." + NewF->getName());
       }
@@ -395,9 +385,9 @@ public:
 JitEngine Jit(0, (char *[]){ nullptr });
 
 extern "C" {
-__attribute__((used))
-void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
-                  int NumRuntimeConstants) {
+__attribute__((used)) void *__jit_entry(char *FnName, char *IR, int IRSize,
+                                        RuntimeConstant *RC,
+                                        int NumRuntimeConstants) {
   TIMESCOPE("__jit_entry");
 #if 0
   dbgs() << "FnName " << FnName << " NumRuntimeConstants " << NumRuntimeConstants << "\n";
@@ -410,8 +400,9 @@ void *__jit_entry(char *FnName, char *IR, RuntimeConstant *RC,
            << "\n";
 #endif
 
-  //dbgs() << "Compile and link " << MangledFnName << "\n";
-  void *JitFnPtr = Jit.compileAndLink(FnName, IR, RC, NumRuntimeConstants);
+  //dbgs() << "JIT Entry " << FnName << "\n";
+  StringRef StrIR(IR, IRSize);
+  void *JitFnPtr = Jit.compileAndLink(FnName, StrIR, RC, NumRuntimeConstants);
 
   return JitFnPtr;
 }
