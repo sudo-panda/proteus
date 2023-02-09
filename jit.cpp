@@ -47,6 +47,13 @@
 #include <iostream>
 
 #define ENABLE_TIME_PROFILING
+#define ENABLE_DEBUG
+
+#ifdef ENABLE_DEBUG
+#define DBG(x) x;
+#else
+#define DBG(x)
+#endif
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -114,9 +121,7 @@ public:
   Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
                                         MaterializationResponsibility &R) {
     TSM.withModuleDo([this](Module &M) {
-#if 0
-      dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n";
-#endif
+      DBG(dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n");
       TIMESCOPE("OptimizationTransform");
       Triple ModuleTriple(M.getTargetTriple());
       std::string CPUStr, FeaturesStr;
@@ -181,9 +186,7 @@ public:
         }
         MPasses.run(M);
       }
-#if 0
-      dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n";
-#endif
+      DBG(dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n");
     });
     return std::move(TSM);
   }
@@ -344,8 +347,10 @@ public:
     ExitOnErr(J->addIRModule(
         ExitOnErr(parseSource(FnName, Suffix, IR, RC, NumRuntimeConstants))));
 
+    DBG(dbgs() << "===\n" << *J->getExecutionSession().getSymbolStringPool() << "===\n");
+
     // (4) Look up the JIT'd function.
-    //dbgs() << "Lookup FnName " << FnName << "\n";
+    DBG(dbgs() << "Lookup FnName " << FnName << " mangled as " << MangledFnName << "\n");
     auto EntryAddr = ExitOnErr(J->lookup(MangledFnName));
 
     JitFnPtr = (void *)EntryAddr.getValue();

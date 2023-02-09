@@ -26,6 +26,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/IPO.h"
@@ -38,6 +39,7 @@
 #include <iostream>
 
 //#define ENABLE_RECURSIVE_JIT
+#define DEBUG_TYPE "jitpass"
 
 using namespace llvm;
 
@@ -152,7 +154,7 @@ void visitor(Module &M, CallGraph &CG) {
     return;
   }
 
-  //dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
+  dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n";
 
   // First pass creates the string Module IR per jit'ed function.
   for (JitFunctionInfo &JFI : JitFunctionInfoList) {
@@ -204,6 +206,11 @@ void visitor(Module &M, CallGraph &CG) {
 
     Function *JitF = cast<Function>(VMap[F]);
     JitF->setLinkage(GlobalValue::ExternalLinkage);
+    // Run a global DCE pass on the JIT module IR to remove
+    // unnecessary symbols and reduce the IR to JIT at runtime.
+    legacy::PassManager Passes;
+    Passes.add(createGlobalDCEPass());
+    Passes.run(*JitMod);
 
     // Set global variables to external linkage, when needed.
     for (auto &GV : M.global_values()) {
@@ -244,7 +251,7 @@ void visitor(Module &M, CallGraph &CG) {
     StripDebugInfo(*JitMod);
 
     if (verifyModule(*JitMod, &errs()))
-      report_fatal_error("Broken module found, compilation aborted!", false);
+      report_fatal_error("Broken JIT module found, compilation aborted!", false);
     else
       dbgs() << "JitMod verified!\n";
 
@@ -253,8 +260,7 @@ void visitor(Module &M, CallGraph &CG) {
     WriteBitcodeToFile(*JitMod, OS);
     OS.flush();
 
-    dbgs() << "=== StrIR\n" << *JitMod << "=== End of StrIR\n";
-    //dbgs() << "=== Post M\n" << M << "=== End of Post M\n";
+    dbgs() << "=== JIT IR\n" << *JitMod << "=== JIT IR\n";
   }
 
   // Create jit entry runtime function.
@@ -348,9 +354,9 @@ void visitor(Module &M, CallGraph &CG) {
     // getchar();
   }
 
-  //dbgs() << "=== Begin Mod\n" << M << "=== End Mod\n";
+  dbgs() << "=== Post M\n" << M << "=== Post M\n";
   if (verifyModule(M, &errs()))
-    report_fatal_error("Broken module found, compilation aborted!", false);
+    report_fatal_error("Broken original module found, compilation aborted!", false);
   else
     dbgs() << "Module verified!\n";
 }
