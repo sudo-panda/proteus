@@ -166,10 +166,13 @@ void visitor(Module &M, CallGraph &CG) {
 
     ValueToValueMapTy VMap;
     auto JitMod = CloneModule(
-        M, VMap, [&ReachableFunctions,&F](const GlobalValue *GV) {
+        M, VMap, [&ReachableFunctions, &F](const GlobalValue *GV) {
+
           if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
             if (!G->isConstant())
               return false;
+            // TODO: Is isConstant() enough? Maybe we want isManifestConstant()
+            // that makes sure that the constant is free of unknown values.
           }
 
           // TODO: do not clone aliases' definitions, it this sound?
@@ -200,42 +203,74 @@ void visitor(Module &M, CallGraph &CG) {
             // getchar();
           }
 
-          // By default, clone the definition.
-          return true;
+          // For the rest global values, keep their definitions only
+          // if they are reachable by any of the functions in the
+          // JIT module.
+          bool Keep = false;
+          for(const User *Usr : GV->users()) {
+            const Instruction *UsrI = dyn_cast<Instruction>(Usr);
+            if (!UsrI)
+              continue;
+            const Function *ParentF = UsrI->getParent()->getParent();
+            if(ReachableFunctions.contains(ParentF)) {
+              Keep = true;
+              break;
+            }
+          }
+
+          return Keep;
         });
 
     Function *JitF = cast<Function>(VMap[F]);
     JitF->setLinkage(GlobalValue::ExternalLinkage);
     // Run a global DCE pass on the JIT module IR to remove
     // unnecessary symbols and reduce the IR to JIT at runtime.
+    dbgs() << "=== Pre DCE JIT IR\n" << *JitMod << "=== End of Pre DCE JIT IR\n";
+    // Using pass for extraction (to remove?)
+    //std::vector<GlobalValue *> GlobalsToExtract;
+    //for (auto *F : ReachableFunctions) {
+    //  GlobalValue *GV = dyn_cast<GlobalValue>(JitF);
+    //  assert(GV && "Expected non-null GV");
+    //  GlobalsToExtract.push_back(GV);
+    //  dbgs() << "Extract global " << *GV << "\n";
+    //}
     legacy::PassManager Passes;
+    // Using pass for extraction (to remove?)
+    //Passes.add(createGVExtractionPass(GlobalsToExtract));
     Passes.add(createGlobalDCEPass());
+    Passes.add(createStripDeadDebugInfoPass());
+    Passes.add(createStripDeadPrototypesPass());
     Passes.run(*JitMod);
 
-    // Set global variables to external linkage, when needed.
-    for (auto &GV : M.global_values()) {
-      if (VMap[&GV])
-        if (auto *GVar = dyn_cast<GlobalVariable>(&GV)) {
-          if (GVar->isConstant())
-            continue;
-          if (GVar->getSection() == "llvm.metadata")
-            continue;
-          if (GVar->getName() == "llvm.global_ctors")
-            continue;
-          if (GVar->isDSOLocal())
-            continue;
-          if (GVar->hasCommonLinkage())
-            continue;
-          //dbgs() << "=== GV\n";
-          //dbgs() << GV << "\n";
-          //dbgs() << "Linkage " << GV.getLinkage() << "\n";
-          //dbgs() << "Visibility " << GV.getVisibility() << "\n";
-          GV.setLinkage(GlobalValue::ExternalLinkage);
-          //dbgs() << "Make " << GV << " External\n";
-          //dbgs() << GV << "\n";
-          //dbgs() << "=== End GV\n";
+    // Update linkage and visibility in the original module only for
+    // globals included in the JIT module required for external
+    // linking.
+    for(auto &GVar : M.globals()) {
+      if (VMap[&GVar]) {
+        dbgs() << "=== GVar\n";
+        dbgs() << GVar << "\n";
+        dbgs() << "Linkage " << GVar.getLinkage() << "\n";
+        dbgs() << "Visibility " << GVar.getVisibility() << "\n";
+        dbgs() << "=== End GV\n";
+
+        if (GVar.isConstant())
+          continue;
+
+        if (GVar.getName() == "llvm.global_ctors") {
+          dbgs() << "Skip llvm.global_ctors";
+          continue;
         }
+
+        if (GVar.hasAvailableExternallyLinkage()) {
+          dbgs() << "Skip available externally";
+          continue;
+        }
+
+        GVar.setLinkage(GlobalValue::ExternalLinkage);
+        GVar.setVisibility(GlobalValue::VisibilityTypes::DefaultVisibility);
+      }
     }
+
 #ifdef ENABLE_RECURSIVE_JIT
     // Set linkage to external for any reachable jit'ed function to enable
     // recursive jit'ing.
@@ -248,19 +283,20 @@ void visitor(Module &M, CallGraph &CG) {
     F->setLinkage(GlobalValue::ExternalLinkage);
 #endif
     // TODO: Do we want to keep debug info?
-    StripDebugInfo(*JitMod);
+    // Keep debug info to explore the interface of GDB for
+    // debugging jitted code.
+    //StripDebugInfo(*JitMod);
 
     if (verifyModule(*JitMod, &errs()))
       report_fatal_error("Broken JIT module found, compilation aborted!", false);
     else
       dbgs() << "JitMod verified!\n";
 
-    // TODO: is writing/reading the bitcode instead of the textual IR faster?
     raw_string_ostream OS(JFI.ModuleIR);
     WriteBitcodeToFile(*JitMod, OS);
     OS.flush();
 
-    dbgs() << "=== JIT IR\n" << *JitMod << "=== JIT IR\n";
+    dbgs() << "=== Post DCE JIT IR\n" << *JitMod << "=== End of Post DCE JIT IR\n";
   }
 
   // Create jit entry runtime function.
@@ -354,7 +390,7 @@ void visitor(Module &M, CallGraph &CG) {
     // getchar();
   }
 
-  dbgs() << "=== Post M\n" << M << "=== Post M\n";
+  dbgs() << "=== Post M\n" << M << "=== End Post M\n";
   if (verifyModule(M, &errs()))
     report_fatal_error("Broken original module found, compilation aborted!", false);
   else
