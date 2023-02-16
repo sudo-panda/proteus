@@ -43,6 +43,11 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Vectorize.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/ExecutionEngine/JITEventListener.h"
+#include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/Object/SymbolSize.h"
+#include "llvm/Support/SHA1.h"
 
 #include <iostream>
 
@@ -187,6 +192,15 @@ public:
         MPasses.run(M);
       }
       DBG(dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n");
+#ifdef ENABLE_DEBUG
+      if (verifyModule(M, &errs()))
+        report_fatal_error(
+            "Broken module found after optimization, JIT compilation aborted!",
+            false);
+      else
+        dbgs() << "Module after optimization verified!\n";
+#endif
+
     });
     return std::move(TSM);
   }
@@ -219,6 +233,40 @@ public:
   int hits = 0;
   int total = 0;
 
+  static void
+  dumpSymbolInfo(const llvm::object::ObjectFile &loadedObj,
+                 const llvm::RuntimeDyld::LoadedObjectInfo &objInfo) {
+    // Dump information about symbols.
+    for (auto symSizePair : llvm::object::computeSymbolSizes(loadedObj)) {
+      auto sym = symSizePair.first;
+      auto size = symSizePair.second;
+      auto symName = sym.getName();
+      // Skip any unnamed symbols.
+      if (!symName || symName->empty())
+        continue;
+      // The relative address of the symbol inside its section.
+      auto symAddr = sym.getAddress();
+      if (!symAddr)
+        continue;
+      // The address the functions was loaded at.
+      auto loadedSymAddress = *symAddr;
+      auto symbolSection = sym.getSection();
+      if (symbolSection) {
+        // Compute the load address of the symbol by adding the section load
+        // address.
+        loadedSymAddress += objInfo.getSectionLoadAddress(*symbolSection.get());
+      }
+      llvm::outs() << llvm::format("Address range: [%12p, %12p]",
+                                   loadedSymAddress, loadedSymAddress + size)
+                   << "\tSymbol: " << *symName << "\n";
+    }
+  }
+  static void notifyLoaded(MaterializationResponsibility &R,
+                    const object::ObjectFile &Obj,
+                    const RuntimeDyld::LoadedObjectInfo &LOI) {
+    dumpSymbolInfo(Obj, LOI);
+  }
+
   JitEngine(int argc, char *argv[]) {
     InitLLVM X(argc, argv);
 
@@ -227,7 +275,33 @@ public:
 
     ExitOnErr.setBanner("JIT: ");
     // Create the LLJIT instance.
-    J = ExitOnErr(LLJITBuilder().create());
+    // TODO: Fix support for debugging jitted code. This appears to be
+    // the correct interface (see orcv2 examples) but it does not work.
+    // By dumpSymbolInfo() the debug sections are not populated. Why?
+    J = ExitOnErr(LLJITBuilder()
+                      .setObjectLinkingLayerCreator([&](ExecutionSession &ES,
+                                                        const Triple &TT) {
+                        auto GetMemMgr = []() {
+                          return std::make_unique<SectionMemoryManager>();
+                        };
+                        auto ObjLinkingLayer =
+                            std::make_unique<RTDyldObjectLinkingLayer>(
+                                ES, std::move(GetMemMgr));
+
+                        // Register the event listener.
+                        ObjLinkingLayer->registerJITEventListener(
+                            *JITEventListener::createGDBRegistrationListener());
+
+                        // Make sure the debug info sections aren't stripped.
+                        ObjLinkingLayer->setProcessAllSections(true);
+
+#ifdef ENABLE_DEBUG
+                        ObjLinkingLayer->setNotifyLoaded(notifyLoaded);
+#endif
+
+                        return ObjLinkingLayer;
+                      })
+                      .create());
     // (2) Resolve symbols in the main process.
     orc::MangleAndInterner Mangle(J->getExecutionSession(), J->getDataLayout());
     J->getMainJITDylib().addGenerator(
@@ -238,7 +312,7 @@ public:
               return Name != MainName;
             })));
 
-    // (2) Install transform to optimize modules when they're materialized.
+    // (3) Install transform to optimize modules when they're materialized.
     J->getIRTransformLayer().setTransform(OptimizationTransform());
 
     //dbgs() << "JIT inited\n";
@@ -266,10 +340,12 @@ public:
             parseIR(MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()), Err, *Ctx)) {
       //dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n";
       Function *F = M->getFunction(FnName);
+      assert(F && "Expected non-null function!");
 
       // Clone the function and replace argument uses with runtime constants.
       ValueToValueMapTy VMap;
       F->setName("");
+      // TODO: is this cloning needed or can we operate directly on F?
       Function *NewF = CloneFunction(F, VMap);
       NewF->setName(FnName);
       for (int I = 0; I < NumRuntimeConstants; ++I) {
@@ -304,6 +380,15 @@ public:
       //dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n";
 
       NewF->setName(FnName + Suffix);
+
+#if 0
+      // TBD: Use hash instead of the manged function name to suffix
+      // internalized functions? Hashing has more predictable symbol
+      // size.
+      SHA1 Hasher;
+      Hasher.update(NewF->getName());
+      auto Hash = toHex(Hasher.result());
+#endif
       for (Function &F : *M) {
         if (F.isDeclaration())
           continue;
@@ -315,12 +400,19 @@ public:
         F.setLinkage(GlobalValue::InternalLinkage);
         // Rename functions to internalize using jit'ed function name.
         F.setName(F.getName() + ".." + NewF->getName());
+#if 0
+        F.setName(F.getName() + "." + Hash);
+#endif
+      }
+
+      for(auto &GO: M->global_objects()) {
+        GO.setComdat(nullptr);
       }
 
       // dbgs() << "NewF " << *NewF << "\n";
       // getchar();
-#if 0
-      dbgs() << "=== Modified Module\n" << *M << "=== End of Modified Module\n";
+#ifdef ENABLE_DEBUG
+      dbgs() << "=== Final Module\n" << *M << "=== End Final Module\n";
       if (verifyModule(*M, &errs()))
         report_fatal_error("Broken module found, JIT compilation aborted!", false);
       else
@@ -342,7 +434,7 @@ public:
     if (JitFnPtr)
       return JitFnPtr;
 
-    dbgs() << "======= COMPILING " << FnName << " =====================\n";
+    dbgs() << "=== JIT compile: " << FnName << "\n";
     // (3) Add modules.
     ExitOnErr(J->addIRModule(
         ExitOnErr(parseSource(FnName, Suffix, IR, RC, NumRuntimeConstants))));
@@ -354,6 +446,8 @@ public:
     auto EntryAddr = ExitOnErr(J->lookup(MangledFnName));
 
     JitFnPtr = (void *)EntryAddr.getValue();
+    DBG(dbgs() << "FnName " << FnName << " Mangled " << MangledFnName << " address " << JitFnPtr << "\n");
+    assert(JitFnPtr && "Expected non-null JIT function pointer");
     insert(MangledFnName, JitFnPtr);
 
     return JitFnPtr;
