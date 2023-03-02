@@ -77,7 +77,7 @@ void parseAnnotations(Module &M) {
           report_fatal_error("Duplicate jit annotation for Fn " + Fn->getName(),
                              false);
 
-      dbgs() << "Function " << Fn->getName() << "\n";
+      dbgs() << "JIT Function " << Fn->getName() << "\n";
 
       auto Annotation = cast<ConstantDataArray>(Entry->getOperand(1)->getOperand(0));
 
@@ -159,6 +159,7 @@ void visitor(Module &M, CallGraph &CG) {
   // First pass creates the string Module IR per jit'ed function.
   for (JitFunctionInfo &JFI : JitFunctionInfoList) {
     Function *F = JFI.Fn;
+    dbgs() << "Processing JIT Function " << F->getName() << "\n";
 
     SmallPtrSet<Function *, 16> ReachableFunctions;
     getReachableFunctions(M, *F, ReachableFunctions);
@@ -277,15 +278,29 @@ void visitor(Module &M, CallGraph &CG) {
     for (auto &JFIInner : JitFunctionInfoList) {
       if (!ReachableFunctions.contains(JFIInner.Fn))
         continue;
-      Function *JitF = cast<Function>(VMap[JFIInner.Fn]);
-      JitF->setLinkage(GlobalValue::ExternalLinkage);
+      if(VMap[JFIInner.Fn]) {
+        Function *JitF = cast<Function>(VMap[JFIInner.Fn]);
+        JFIInner.Fn->setLinkage(GlobalValue::ExternalLinkage);
+        JFIInner.Fn->setVisibility(GlobalValue::VisibilityTypes::DefaultVisibility);
+      }
     }
-    F->setLinkage(GlobalValue::ExternalLinkage);
 #endif
-    // TODO: Do we want to keep debug info?
-    // Keep debug info to explore the interface of GDB for
-    // debugging jitted code.
-    //StripDebugInfo(*JitMod);
+    // TODO: Do we want to keep debug info to use for GDB/LLDB
+    // interfaces for debugging jitted code?
+    StripDebugInfo(*JitMod);
+
+    // Add metadata for the JIT function to store the argument positions for
+    // runtime constants.
+    LLVMContext &Ctx = JitMod->getContext();
+    SmallVector<Metadata *> ConstArgNos;
+    for (size_t I = 0; I < JFI.ConstantArgs.size(); ++I) {
+      int ArgNo = JFI.ConstantArgs[I];
+      Metadata *Meta = ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(Ctx), ArgNo));
+      ConstArgNos.push_back(Meta);
+    }
+    MDNode *Node = MDNode::get(JitMod->getContext(), ConstArgNos);
+    JitF->setMetadata("jit_arg_nos", Node);
 
     if (verifyModule(*JitMod, &errs()))
       report_fatal_error("Broken JIT module found, compilation aborted!", false);
@@ -305,19 +320,14 @@ void visitor(Module &M, CallGraph &CG) {
   Type *Int64Ty = Type::getInt64Ty(M.getContext());
   // Use Int64 type for the Value, big enough to hold primitives.
   StructType *RuntimeConstantTy =
-      StructType::create({Int32Ty, Int64Ty}, "struct.args");
+      StructType::create({Int64Ty}, "struct.args");
 
-  // TODO: This works by embedding the jit.bc library.
-  // Function *JitEntryFn = M.getFunction("__jit_entry");
-  // assert(JitEntryFn && "Expected non-null JitEntryFn");
-  // FunctionType *JitEntryFnTy = JitEntryFn->getFunctionType();
   FunctionType *JitEntryFnTy =
       FunctionType::get(VoidPtrTy,
                         {VoidPtrTy, VoidPtrTy, Int32Ty,
                          RuntimeConstantTy->getPointerTo(), Int32Ty},
                         /* isVarArg=*/false);
-  Function *JitEntryFn = Function::Create(
-      JitEntryFnTy, GlobalValue::ExternalLinkage, "__jit_entry", M);
+  FunctionCallee JitEntryFn = M.getOrInsertFunction("__jit_entry", JitEntryFnTy);
 
   // Second pass replaces jit'ed functions in the original module with stubs to
   // call the runtime entry point that compiles and links.
@@ -349,6 +359,11 @@ void visitor(Module &M, CallGraph &CG) {
     // Create the runtime constants data structure passed to the jit entry.
     Value *RuntimeConstantsAlloca = nullptr;
     if (JFI.ConstantArgs.size() > 0) {
+      //auto *GV = RuntimeConstantsAlloca =
+      //    new GlobalVariable(M, RuntimeConstantArrayTy, /* isConstant */ false,
+      //                       GlobalValue::InternalLinkage,
+      //                       Constant::getNullValue(RuntimeConstantArrayTy),
+      //                       StubFn->getName() + ".rconsts");
       RuntimeConstantsAlloca = Builder.CreateAlloca(RuntimeConstantArrayTy);
       // Zero-initialize the alloca to avoid stack garbage for caching.
       Builder.CreateStore(Constant::getNullValue(RuntimeConstantArrayTy),
@@ -357,23 +372,17 @@ void visitor(Module &M, CallGraph &CG) {
         auto *GEP = Builder.CreateInBoundsGEP(
             RuntimeConstantArrayTy, RuntimeConstantsAlloca,
             {Builder.getInt32(0), Builder.getInt32(ArgI)});
-        auto *GEPArgNo = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 0);
-
         int ArgNo = JFI.ConstantArgs[ArgI];
-        Builder.CreateStore(Builder.getInt32(ArgNo), GEPArgNo);
-
-        auto *GEPValue = Builder.CreateStructGEP(RuntimeConstantTy, GEP, 1);
-        Builder.CreateStore(StubFn->getArg(ArgNo), GEPValue);
+        Builder.CreateStore(StubFn->getArg(ArgNo), GEP);
       }
-    }
-    else
+    } else
       RuntimeConstantsAlloca =
           Constant::getNullValue(RuntimeConstantArrayTy->getPointerTo());
 
     assert(RuntimeConstantsAlloca && "Expected non-null runtime constants alloca");
 
     auto *JitFnPtr = Builder.CreateCall(
-        JitEntryFnTy, JitEntryFn,
+        JitEntryFn,
         {FnNameGlobal, StrIRGlobal, Builder.getInt32(JFI.ModuleIR.size()),
          RuntimeConstantsAlloca, Builder.getInt32(JFI.ConstantArgs.size())});
     SmallVector<Value *, 8> Args;

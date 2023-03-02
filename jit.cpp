@@ -18,6 +18,7 @@
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -35,6 +36,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -47,12 +49,11 @@
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/Object/SymbolSize.h"
-#include "llvm/Support/SHA1.h"
 
 #include <iostream>
 
-#define ENABLE_TIME_PROFILING
-#define ENABLE_DEBUG
+//#define ENABLE_TIME_PROFILING
+//#define ENABLE_DEBUG
 
 #ifdef ENABLE_DEBUG
 #define DBG(x) x;
@@ -126,7 +127,7 @@ public:
   Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
                                         MaterializationResponsibility &R) {
     TSM.withModuleDo([this](Module &M) {
-      DBG(dbgs() << "--- BEFORE OPTIMIZATION ---\n" << M << "\n");
+      DBG(dbgs() << "=== Begin Before Optimization\n" << M << "=== End Before\n");
       TIMESCOPE("OptimizationTransform");
       Triple ModuleTriple(M.getTargetTriple());
       std::string CPUStr, FeaturesStr;
@@ -165,14 +166,15 @@ public:
         MPasses.add(TPC);
       }
 
-      unsigned int OptLevel = 3;
+      unsigned int OptLevel = 2;
 
       {
         TIMESCOPE("Builder");
         PassManagerBuilder Builder;
         Builder.OptLevel = OptLevel;
         Builder.SizeLevel = 0;
-        Builder.Inliner = createFunctionInliningPass(OptLevel, 0, false);
+        Builder.Inliner = createAlwaysInlinerLegacyPass();
+        //Builder.Inliner = createFunctionInliningPass(OptLevel, 0, false);
         Builder.DisableUnrollLoops = false;
         Builder.LoopVectorize = true;
         Builder.SLPVectorize = true;
@@ -191,7 +193,7 @@ public:
         }
         MPasses.run(M);
       }
-      DBG(dbgs() << "--- AFTER OPTIMIZATION ---\n" << M << "\n");
+      DBG(dbgs() << "=== Begin After Optimization\n" << M << "=== End After Optimization\n");
 #ifdef ENABLE_DEBUG
       if (verifyModule(M, &errs()))
         report_fatal_error(
@@ -207,7 +209,6 @@ public:
 };
 
 struct RuntimeConstant {
-  int ArgNo;
   union {
     int32_t Int32Val;
     int64_t Int64Val;
@@ -215,6 +216,10 @@ struct RuntimeConstant {
     double DoubleVal;
   };
 };
+
+inline hash_code hash_value(const RuntimeConstant &RC) {
+  return hash_value(RC.Int64Val);
+}
 
 
 static codegen::RegisterCodeGenFlags CFG;
@@ -228,8 +233,12 @@ public:
   struct JitCacheEntry {
     void *Ptr;
     int num_execs;
+#ifdef ENABLE_DEBUG
+    std::string FnName;
+    SmallVector<RuntimeConstant, 8> RCVector;
+#endif
   };
-  StringMap<JitCacheEntry> JitCache;
+  DenseMap<uint64_t, JitCacheEntry> JitCache;
   int hits = 0;
   int total = 0;
 
@@ -320,12 +329,19 @@ public:
   }
 
   ~JitEngine() {
+    std::cout << std::dec;
     std::cout << "JitCache hits " << hits << " total " << total << "\n";
     for (auto &It : JitCache) {
-      StringRef FnName = It.getKey();
-      JitCacheEntry &JCE = It.getValue();
-      std::cout << "FnName " << FnName.str() << " num_execs " << JCE.num_execs
-                << "\n";
+      uint64_t HashValue = It.first;
+      JitCacheEntry &JCE = It.second;
+      std::cout << "HashValue " << HashValue << " num_execs " << JCE.num_execs;
+#ifdef ENABLE_DEBUG
+      std::cout << " FnName " << JCE.FnName << " RCs [";
+      for (auto &RC : JCE.RCVector)
+        std::cout << RC.Int64Val << ", ";
+      std::cout << "]";
+#endif
+      std::cout << "\n";
     }
   }
 
@@ -341,6 +357,8 @@ public:
       //dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n";
       Function *F = M->getFunction(FnName);
       assert(F && "Expected non-null function!");
+      MDNode *Node = F->getMetadata("jit_arg_nos");
+      DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node << "\n");
 
       // Clone the function and replace argument uses with runtime constants.
       ValueToValueMapTy VMap;
@@ -348,8 +366,10 @@ public:
       // TODO: is this cloning needed or can we operate directly on F?
       Function *NewF = CloneFunction(F, VMap);
       NewF->setName(FnName);
-      for (int I = 0; I < NumRuntimeConstants; ++I) {
-        int ArgNo = RC[I].ArgNo;
+      for (int I = 0; I < Node->getNumOperands(); ++I) {
+        ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
+        ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
+        int ArgNo = ConstInt->getZExtValue();
         Value *Arg = NewF->getArg(ArgNo);
         // TODO: add constant creation for FP types too.
         Type *ArgType = Arg->getType();
@@ -381,14 +401,6 @@ public:
 
       NewF->setName(FnName + Suffix);
 
-#if 0
-      // TBD: Use hash instead of the manged function name to suffix
-      // internalized functions? Hashing has more predictable symbol
-      // size.
-      SHA1 Hasher;
-      Hasher.update(NewF->getName());
-      auto Hash = toHex(Hasher.result());
-#endif
       for (Function &F : *M) {
         if (F.isDeclaration())
           continue;
@@ -399,10 +411,8 @@ public:
         // Internalize other functions in the module.
         F.setLinkage(GlobalValue::InternalLinkage);
         // Rename functions to internalize using jit'ed function name.
-        F.setName(F.getName() + ".." + NewF->getName());
-#if 0
-        F.setName(F.getName() + "." + Hash);
-#endif
+        F.setName(F.getName() + Suffix);
+        F.addFnAttr(Attribute::AlwaysInline);
       }
 
       for(auto &GO: M->global_objects()) {
@@ -424,20 +434,24 @@ public:
     return createSMDiagnosticError(Err);
   }
 
-  void *compileAndLink(StringRef FnName, StringRef IR, RuntimeConstant *RC,
+  void *compileAndLink(StringRef FnName, char *IR, int IRSize, RuntimeConstant *RC,
                       int NumRuntimeConstants) {
     TIMESCOPE("compileAndLink");
-    std::string Suffix = mangleSuffix(FnName, RC, NumRuntimeConstants);
-    std::string MangledFnName = FnName.str() + Suffix;
 
-    void *JitFnPtr = lookup(MangledFnName);
+    uint64_t HashValue = hash(FnName, RC, NumRuntimeConstants);
+    void *JitFnPtr = lookupCache(HashValue);
     if (JitFnPtr)
       return JitFnPtr;
 
-    dbgs() << "=== JIT compile: " << FnName << "\n";
+    std::string Suffix = mangleSuffix(HashValue);
+    std::string MangledFnName = FnName.str() + Suffix;
+
+    dbgs() << "=== JIT compile: " << FnName << " Mangled " << MangledFnName
+           << " RC HashValue " << HashValue << "\n";
+    StringRef StrIR(IR, IRSize);
     // (3) Add modules.
     ExitOnErr(J->addIRModule(
-        ExitOnErr(parseSource(FnName, Suffix, IR, RC, NumRuntimeConstants))));
+        ExitOnErr(parseSource(FnName, Suffix, StrIR, RC, NumRuntimeConstants))));
 
     DBG(dbgs() << "===\n" << *J->getExecutionSession().getSymbolStringPool() << "===\n");
 
@@ -448,36 +462,57 @@ public:
     JitFnPtr = (void *)EntryAddr.getValue();
     DBG(dbgs() << "FnName " << FnName << " Mangled " << MangledFnName << " address " << JitFnPtr << "\n");
     assert(JitFnPtr && "Expected non-null JIT function pointer");
-    insert(MangledFnName, JitFnPtr);
+    insertCache(HashValue, JitFnPtr
+#ifdef ENABLE_DEBUG
+                ,
+                FnName, RC, NumRuntimeConstants
+#endif
+    );
 
     return JitFnPtr;
   }
 
-  std::string mangleSuffix(StringRef FnName, RuntimeConstant *RC,
-                           int NumRuntimeConstants) {
-    // Generate mangled name with runtime constants.
-    std::string Suffix = ".";
-    for (int I = 0; I < NumRuntimeConstants; ++I)
-      Suffix += ("." + std::to_string(RC[I].Int64Val));
-    return Suffix;
+  uint64_t hash(StringRef FnName, RuntimeConstant *RC, int NumRuntimeConstants) {
+    ArrayRef<RuntimeConstant> Data(RC, NumRuntimeConstants);
+    auto HashValue = hash_combine(FnName, Data);
+    return HashValue;
   }
 
-  void *lookup(StringRef FnName) {
+  std::string mangleSuffix(uint64_t HashValue) {
+    // Generate mangled suffix from runtime constants.
+    return "_" + utostr(HashValue);
+  }
+
+  void *lookupCache(uint64_t HashValue) {
     TIMESCOPE("lookup");
     total++;
 
-    auto It = JitCache.find(FnName.str());
+    auto It = JitCache.find(HashValue);
     if (It == JitCache.end())
       return nullptr;
 
-    It->getValue().num_execs++;
+    It->second.num_execs++;
     hits++;
-    return It->getValue().Ptr;
+    return It->second.Ptr;
   }
 
-  void insert(StringRef FnName, void *Ptr) {
-    TIMESCOPE("insert");
-    JitCache[FnName.str()] = {Ptr, /* num_execs */ 1};
+  void insertCache(uint64_t HashValue, void *Ptr
+#ifdef ENABLE_DEBUG
+                   ,
+                   StringRef FnName, RuntimeConstant *RC,
+                   int NumRuntimeConstants
+#endif
+  ) {
+#ifdef ENABLE_DEBUG
+    if (JitCache.count(HashValue))
+      report_fatal_error("JitCache collision detected");
+#endif
+    JitCache[HashValue] = {Ptr, /* num_execs */ 1};
+#ifdef ENABLE_DEBUG
+    JitCache[HashValue].FnName = FnName.str();
+    for (size_t I = 0; I < NumRuntimeConstants; ++I)
+      JitCache[HashValue].RCVector.push_back(RC[I]);
+#endif
   }
 };
 
@@ -489,19 +524,17 @@ __attribute__((used)) void *__jit_entry(char *FnName, char *IR, int IRSize,
                                         int NumRuntimeConstants) {
   TIMESCOPE("__jit_entry");
 #if 0
-  dbgs() << "FnName " << FnName << " NumRuntimeConstants " << NumRuntimeConstants << "\n";
+  dbgs() << "FnName " << FnName << " NumRuntimeConstants "
+         << NumRuntimeConstants << "\n";
   for (int I = 0; I < NumRuntimeConstants; ++I)
-    dbgs() << "RC[" << I << "]: ArgNo=" << RC[I].ArgNo
-           << " Value Int32=" << RC[I].Int32Val
+    dbgs() << " Value Int32=" << RC[I].Int32Val
            << " Value Int64=" << RC[I].Int64Val
            << " Value Float=" << RC[I].FloatVal
-           << " Value Double=" << RC[I].DoubleVal
-           << "\n";
+           << " Value Double=" << RC[I].DoubleVal << "\n";
 #endif
 
   //dbgs() << "JIT Entry " << FnName << "\n";
-  StringRef StrIR(IR, IRSize);
-  void *JitFnPtr = Jit.compileAndLink(FnName, StrIR, RC, NumRuntimeConstants);
+  void *JitFnPtr = Jit.compileAndLink(FnName, IR, IRSize, RC, NumRuntimeConstants);
 
   return JitFnPtr;
 }
