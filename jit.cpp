@@ -446,8 +446,6 @@ public:
     std::string Suffix = mangleSuffix(HashValue);
     std::string MangledFnName = FnName.str() + Suffix;
 
-    dbgs() << "=== JIT compile: " << FnName << " Mangled " << MangledFnName
-           << " RC HashValue " << HashValue << "\n";
     StringRef StrIR(IR, IRSize);
     // (3) Add modules.
     ExitOnErr(J->addIRModule(
@@ -469,6 +467,8 @@ public:
 #endif
     );
 
+    dbgs() << "=== JIT compile: " << FnName << " Mangled " << MangledFnName
+           << " RC HashValue " << HashValue << " Addr " << JitFnPtr << "\n";
     return JitFnPtr;
   }
 

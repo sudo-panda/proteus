@@ -170,10 +170,12 @@ void visitor(Module &M, CallGraph &CG) {
         M, VMap, [&ReachableFunctions, &F](const GlobalValue *GV) {
 
           if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
-            if (!G->isConstant())
-              return false;
+            // Always keep the definition of constant global variables
+            // (will be removed later if unused by global DCE).
             // TODO: Is isConstant() enough? Maybe we want isManifestConstant()
             // that makes sure that the constant is free of unknown values.
+            if (G->isConstant())
+              return true;
           }
 
           // TODO: do not clone aliases' definitions, it this sound?
