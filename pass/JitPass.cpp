@@ -204,24 +204,12 @@ void visitor(Module &M, CallGraph &CG) {
 
             // dbgs() << "Keep reachable " << F->getName() << "\n";
             // getchar();
+
+            return true;
           }
 
-          // For the rest global values, keep their definitions only
-          // if they are reachable by any of the functions in the
-          // JIT module.
-          bool Keep = false;
-          for(const User *Usr : GV->users()) {
-            const Instruction *UsrI = dyn_cast<Instruction>(Usr);
-            if (!UsrI)
-              continue;
-            const Function *ParentF = UsrI->getParent()->getParent();
-            if(ReachableFunctions.contains(ParentF)) {
-              Keep = true;
-              break;
-            }
-          }
-
-          return Keep;
+          // For the rest global values do not keep their definitions.
+          return false;
         });
 
     Function *JitF = cast<Function>(VMap[F]);
