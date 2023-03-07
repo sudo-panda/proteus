@@ -30,6 +30,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
 #include "llvm/Pass.h"
@@ -170,12 +171,23 @@ void visitor(Module &M, CallGraph &CG) {
         M, VMap, [&ReachableFunctions, &F](const GlobalValue *GV) {
 
           if (const GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
-            // Always keep the definition of constant global variables
-            // (will be removed later if unused by global DCE).
+            if (!G->isConstant())
+              return false;
+            // For constant global variables, keep their definitions only
+            // if they are reachable by any of the functions in the
+            // JIT module.
             // TODO: Is isConstant() enough? Maybe we want isManifestConstant()
             // that makes sure that the constant is free of unknown values.
-            if (G->isConstant())
-              return true;
+            for (const User *Usr : GV->users()) {
+              const Instruction *UsrI = dyn_cast<Instruction>(Usr);
+              if (!UsrI)
+                continue;
+              const Function *ParentF = UsrI->getParent()->getParent();
+              if (ReachableFunctions.contains(ParentF))
+                return true;
+            }
+
+            return false;
           }
 
           // TODO: do not clone aliases' definitions, it this sound?
@@ -218,16 +230,35 @@ void visitor(Module &M, CallGraph &CG) {
     // unnecessary symbols and reduce the IR to JIT at runtime.
     dbgs() << "=== Pre DCE JIT IR\n" << *JitMod << "=== End of Pre DCE JIT IR\n";
     // Using pass for extraction (to remove?)
-    //std::vector<GlobalValue *> GlobalsToExtract;
-    //for (auto *F : ReachableFunctions) {
+    // std::vector<GlobalValue *> GlobalsToExtract;
+    // for (auto *F : ReachableFunctions) {
     //  GlobalValue *GV = dyn_cast<GlobalValue>(JitF);
     //  assert(GV && "Expected non-null GV");
     //  GlobalsToExtract.push_back(GV);
     //  dbgs() << "Extract global " << *GV << "\n";
     //}
+
+    // Internalize functions, besides JIT function, in the module
+    // to inline.
+    for (Function &JitModF : *JitMod) {
+      if (JitModF.isDeclaration())
+        continue;
+
+      if (&JitModF == JitF)
+        continue;
+
+      // Internalize other functions in the module.
+      JitModF.setLinkage(GlobalValue::InternalLinkage);
+      // F.setLinkage(GlobalValue::PrivateLinkage);
+      JitModF.removeFnAttr(Attribute::NoInline);
+      // F.addFnAttr(Attribute::InlineHint);
+      JitModF.addFnAttr(Attribute::AlwaysInline);
+    }
+
     legacy::PassManager Passes;
     // Using pass for extraction (to remove?)
     //Passes.add(createGVExtractionPass(GlobalsToExtract));
+    Passes.add(createAlwaysInlinerLegacyPass());
     Passes.add(createGlobalDCEPass());
     Passes.add(createStripDeadDebugInfoPass());
     Passes.add(createStripDeadPrototypesPass());
