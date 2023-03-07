@@ -32,7 +32,9 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
@@ -53,7 +55,10 @@
 #include <iostream>
 
 //#define ENABLE_TIME_PROFILING
+//#define ENABLE_PERFMAP
 //#define ENABLE_DEBUG
+
+#define ENABLE_RUNTIME_CONSTPROP
 
 #ifdef ENABLE_DEBUG
 #define DBG(x) x;
@@ -173,7 +178,8 @@ public:
         PassManagerBuilder Builder;
         Builder.OptLevel = OptLevel;
         Builder.SizeLevel = 0;
-        Builder.Inliner = createAlwaysInlinerLegacyPass();
+        Builder.Inliner = nullptr;
+        //Builder.Inliner = createAlwaysInlinerLegacyPass();
         //Builder.Inliner = createFunctionInliningPass(OptLevel, 0, false);
         Builder.DisableUnrollLoops = false;
         Builder.LoopVectorize = true;
@@ -246,6 +252,12 @@ public:
   dumpSymbolInfo(const llvm::object::ObjectFile &loadedObj,
                  const llvm::RuntimeDyld::LoadedObjectInfo &objInfo) {
     // Dump information about symbols.
+    auto pid = sys::Process::getProcessId();
+    std::error_code EC;
+    raw_fd_ostream ofd("/tmp/perf-" + std::to_string(pid) + ".map", EC,
+                       sys::fs::OF_Append);
+    if (EC)
+      report_fatal_error("Cannot open perf map file");
     for (auto symSizePair : llvm::object::computeSymbolSizes(loadedObj)) {
       auto sym = symSizePair.first;
       auto size = symSizePair.second;
@@ -268,7 +280,13 @@ public:
       llvm::outs() << llvm::format("Address range: [%12p, %12p]",
                                    loadedSymAddress, loadedSymAddress + size)
                    << "\tSymbol: " << *symName << "\n";
+
+      if (size > 0)
+        ofd << llvm::format("%lx %x)", loadedSymAddress, size) << " "
+            << *symName << "\n";
     }
+
+    ofd.close();
   }
   static void notifyLoaded(MaterializationResponsibility &R,
                     const object::ObjectFile &Obj,
@@ -304,7 +322,7 @@ public:
                         // Make sure the debug info sections aren't stripped.
                         ObjLinkingLayer->setProcessAllSections(true);
 
-#ifdef ENABLE_DEBUG
+#if defined(ENABLE_DEBUG) || defined(ENABLE_PERFMAP)
                         ObjLinkingLayer->setNotifyLoaded(notifyLoaded);
 #endif
 
@@ -360,17 +378,13 @@ public:
       MDNode *Node = F->getMetadata("jit_arg_nos");
       DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node << "\n");
 
-      // Clone the function and replace argument uses with runtime constants.
-      ValueToValueMapTy VMap;
-      F->setName("");
-      // TODO: is this cloning needed or can we operate directly on F?
-      Function *NewF = CloneFunction(F, VMap);
-      NewF->setName(FnName);
+      // Replace argument uses with runtime constants.
+#ifdef ENABLE_RUNTIME_CONSTPROP
       for (int I = 0; I < Node->getNumOperands(); ++I) {
         ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
         ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
         int ArgNo = ConstInt->getZExtValue();
-        Value *Arg = NewF->getArg(ArgNo);
+        Value *Arg = F->getArg(ArgNo);
         // TODO: add constant creation for FP types too.
         Type *ArgType = Arg->getType();
         Constant *C = nullptr;
@@ -394,33 +408,18 @@ public:
 
         Arg->replaceAllUsesWith(C);
       }
-      F->replaceAllUsesWith(NewF);
-      F->eraseFromParent();
+#endif
 
       //dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n";
 
-      NewF->setName(FnName + Suffix);
+      F->setName(FnName + Suffix);
 
-      for (Function &F : *M) {
-        if (F.isDeclaration())
-          continue;
-
-        if (&F == NewF)
-          continue;
-
-        // Internalize other functions in the module.
-        F.setLinkage(GlobalValue::InternalLinkage);
-        // Rename functions to internalize using jit'ed function name.
-        F.setName(F.getName() + Suffix);
-        F.addFnAttr(Attribute::AlwaysInline);
-      }
-
+#if 0
       for(auto &GO: M->global_objects()) {
         GO.setComdat(nullptr);
       }
+#endif
 
-      // dbgs() << "NewF " << *NewF << "\n";
-      // getchar();
 #ifdef ENABLE_DEBUG
       dbgs() << "=== Final Module\n" << *M << "=== End Final Module\n";
       if (verifyModule(*M, &errs()))
