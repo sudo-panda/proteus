@@ -111,6 +111,10 @@ static bool isDeviceCompilation(Module &M) {
   if (TargetTriple.isNVPTX() || TargetTriple.isAMDGCN())
     return true;
 
+  return false;
+}
+
+static void gatherKernels(Module &M) {
 #if ENABLE_HIP
   Function *RegisterFunction = M.getFunction("__hipRegisterFunction");
 #elif ENABLE_CUDA
@@ -133,11 +137,9 @@ static bool isDeviceCompilation(Module &M) {
                << "\n";
       }
   }
-
-  return false;
 }
 
-static bool isDeviceKernel(Module &M, Function &Fn) {
+static bool isDeviceKernelStub(Module &M, Function &Fn) {
 #if ENABLE_HIP
   Function *LaunchKernelFn = M.getFunction("hipLaunchKernel");
 #elif ENABLE_CUDA
@@ -176,7 +178,9 @@ static bool HasDeviceKernels(Module &M) {
 void parseAnnotations(Module &M) {
   auto GlobalAnnotations = M.getNamedGlobal("llvm.global.annotations");
   if (GlobalAnnotations) {
-    dbgs() << "isDevice " << isDeviceCompilation(M) << "\n";
+    bool IsDeviceCompilation = isDeviceCompilation(M);
+    if (HasDeviceKernels(M))
+      gatherKernels(M);
     auto Array = cast<ConstantArray>(GlobalAnnotations->getOperand(0));
     dbgs() << "Array " << *Array << "\n";
     for (int i = 0; i < Array->getNumOperands(); i++) {
@@ -186,6 +190,17 @@ void parseAnnotations(Module &M) {
       auto Fn = dyn_cast<Function>(Entry->getOperand(0)->stripPointerCasts());
 
       assert(Fn && "Expected function in entry operands");
+
+      // Check the annotated functions is a kernel function.
+      if (IsDeviceCompilation)
+      // TODO: Implement check for CUDA using nvvm.annotations metadata.
+#if ENABLE_HIP
+        if (Fn->getCallingConv() != CallingConv::AMDGPU_KERNEL)
+          report_fatal_error(std::string{} + __FILE__ + ":" +
+                             std::to_string(__LINE__) +
+                             " => Expected the annotated Fn " + Fn->getName() +
+                             " to be a kernel function!");
+#endif
 
       if (JitFunctionInfoMap.contains(Fn))
         report_fatal_error("Duplicate jit annotation for Fn " + Fn->getName(),
@@ -289,6 +304,24 @@ void runCleanupPassPipeline(Module &M) {
   Passes.addPass(StripDeadDebugInfoPass());
   Passes.addPass(StripDeadPrototypesPass());
   // JitMod
+  Passes.run(M, MAM);
+}
+
+void runOptimizationPassPipeline(Module &M) {
+  PassBuilder PB;
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  ModulePassManager Passes =
+      PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
   Passes.run(M, MAM);
 }
 
@@ -396,6 +429,7 @@ static void createJITModule(Module &M,
                << *JitMod << "=== End of Pre Passes JIT R\n");
 
   runCleanupPassPipeline(*JitMod);
+  runOptimizationPassPipeline(*JitMod);
 
   DEBUG(dbgs() << "=== Post Passes JIT IR\n"
                << *JitMod << "=== End of Post Passes JIT R\n");
@@ -766,9 +800,22 @@ static void emitJITKernel(Module &M,
 
   SmallVector<CallBase *> ToBeReplaced;
   for (User *Usr : LaunchKernelFn->users())
-    if (CallBase *CB = dyn_cast<CallBase>(Usr))
-      if (getStubGV(CB->getArgOperand(0)) == JITFn)
-        ToBeReplaced.push_back(CB);
+    if (CallBase *CB = dyn_cast<CallBase>(Usr)) {
+      // NOTE: We search for calls to the LaunchKernelFn that directly call the
+      // kernel through its global value to replace with JIT kernel entries.
+      // NOTE: cudaLaunchKernel first operand is the stub function,
+      // hipLaunchKernel is a global variable that points to the stub function
+      // hence we use GlobalValue instead of GlobalVaraible.
+      // TODO: Instrument for indirect launching.
+      auto *KernelGV = dyn_cast<GlobalValue>(CB->getArgOperand(0));
+      if (!KernelGV)
+        continue;
+
+      if (getStubGV(KernelGV) != JITFn)
+        continue;
+
+      ToBeReplaced.push_back(CB);
+    }
 
   for (CallBase *CB : ToBeReplaced)
     emitJITKernelEntry(M, JITInfo, CB);
@@ -922,8 +969,7 @@ void visitor(Module &M, CallGraph &CG) {
     Function *JITFn = JFI.first;
     dbgs() << "Processing JIT Function " << JITFn->getName() << "\n";
     CallBase *LaunchKernelCall = nullptr;
-    StringRef KernelName;
-    if (isDeviceKernel(M, *JITFn)) {
+    if (isDeviceKernelStub(M, *JITFn)) {
       emitJITKernel(M, JFI);
       dbgs() << "DONE!\n";
 

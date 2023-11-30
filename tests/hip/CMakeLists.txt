@@ -20,6 +20,7 @@ function(CREATE_TEST exe source)
         LANGUAGE HIP
         OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/pass/JitPass.cpp
     )
+    add_dependencies(${exe}.hip JitPass)
 
     target_link_libraries(${exe}.hip PUBLIC jit)
 
@@ -38,6 +39,7 @@ function(CREATE_TEST_RDC exe source)
         LANGUAGE HIP
         OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/pass/JitPass.cpp
     )
+    add_dependencies(${exe}.hip.rdc JitPass)
 
     target_link_libraries(${exe}.hip.rdc PUBLIC jit)
 
@@ -63,6 +65,7 @@ CREATE_TEST(kernel_args kernel_args.cpp)
 CREATE_TEST(kernels_gvar kernels_gvar.cpp)
 CREATE_TEST(kernel_launches kernel_launches.cpp)
 CREATE_TEST(kernel_launches_args kernel_launches_args.cpp)
+CREATE_TEST(indirect_launcher indirect_launcher.cpp)
 CREATE_TEST(daxpy daxpy.cpp)
 
 CREATE_TEST_RDC(kernel kernel.cpp)
@@ -71,4 +74,5 @@ CREATE_TEST_RDC(kernel_args kernel_args.cpp)
 CREATE_TEST_RDC(kernels_gvar kernels_gvar.cpp)
 CREATE_TEST_RDC(kernel_launches kernel_launches.cpp)
 CREATE_TEST_RDC(kernel_launches_args kernel_launches_args.cpp)
+CREATE_TEST_RDC(indirect_launcher indirect_launcher.cpp)
 CREATE_TEST_RDC(daxpy daxpy.cpp)
