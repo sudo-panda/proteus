@@ -23,14 +23,10 @@
 //=============================================================================
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
-#include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
 #include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/InstIterator.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Object/ELF.h"
-#include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/Debug.h"
@@ -43,15 +39,11 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <llvm/ADT/StringRef.h>
-#include <llvm/CodeGen/Register.h>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/Constant.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalValue.h>
-#include <llvm/Transforms/Utils/BuildLibCalls.h>
-
-#include <iostream>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
@@ -59,6 +51,8 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/MemoryBufferRef.h>
+
+#include <iostream>
 #include <string>
 
 // #define ENABLE_RECURSIVE_JIT
@@ -87,6 +81,8 @@ MapVector<Function *, JitFunctionInfo> JitFunctionInfoMap;
 
 DenseMap<Value *, GlobalVariable *> StubToKernelMap;
 
+SmallPtrSet<Function *, 16> ModuleDeviceKernels;
+
 static Value *getStubGV(Value *Operand) {
 #if ENABLE_HIP
   // NOTE: Hip creates a global named after the device kernel function that
@@ -114,7 +110,7 @@ static bool isDeviceCompilation(Module &M) {
   return false;
 }
 
-static void gatherKernels(Module &M) {
+static void gatherKernelStubs(Module &M) {
 #if ENABLE_HIP
   Function *RegisterFunction = M.getFunction("__hipRegisterFunction");
 #elif ENABLE_CUDA
@@ -137,6 +133,44 @@ static void gatherKernels(Module &M) {
                << "\n";
       }
   }
+}
+
+static SmallPtrSet<Function *, 16> getDeviceKernels(Module &M) {
+  SmallPtrSet<Function *, 16> Kernels;
+#if ENABLE_CUDA
+  NamedMDNode *MD = M.getOrInsertNamedMetadata("nvvm.annotations");
+
+  if (!MD)
+    return Kernels;
+
+  for (auto *Op : MD->operands()) {
+    if (Op->getNumOperands() < 2)
+      continue;
+    MDString *KindID = dyn_cast<MDString>(Op->getOperand(1));
+    if (!KindID || KindID->getString() != "kernel")
+      continue;
+
+    Function *KernelFn =
+        mdconst::dyn_extract_or_null<Function>(Op->getOperand(0));
+    if (!KernelFn)
+      continue;
+
+    Kernels.insert(KernelFn);
+  }
+#elif ENABLE_HIP
+  for (Function &F : M)
+    if (F.getCallingConv() == CallingConv::AMDGPU_KERNEL)
+      Kernels.insert(&F);
+#endif
+
+  return Kernels;
+}
+
+static bool isDeviceKernel(const Function *F) {
+  if (ModuleDeviceKernels.contains(F))
+    return true;
+
+  return false;
 }
 
 static bool isDeviceKernelStub(Module &M, Function &Fn) {
@@ -163,7 +197,7 @@ static bool isDeviceKernelStub(Module &M, Function &Fn) {
   return false;
 }
 
-static bool HasDeviceKernels(Module &M) {
+static bool HasDeviceKernelCalls(Module &M) {
 #if ENABLE_HIP
   Function *LaunchKernelFn = M.getFunction("hipLaunchKernel");
 #elif ENABLE_CUDA
@@ -179,8 +213,8 @@ void parseAnnotations(Module &M) {
   auto GlobalAnnotations = M.getNamedGlobal("llvm.global.annotations");
   if (GlobalAnnotations) {
     bool IsDeviceCompilation = isDeviceCompilation(M);
-    if (HasDeviceKernels(M))
-      gatherKernels(M);
+    if (HasDeviceKernelCalls(M))
+      gatherKernelStubs(M);
     auto Array = cast<ConstantArray>(GlobalAnnotations->getOperand(0));
     dbgs() << "Array " << *Array << "\n";
     for (int i = 0; i < Array->getNumOperands(); i++) {
@@ -192,15 +226,14 @@ void parseAnnotations(Module &M) {
       assert(Fn && "Expected function in entry operands");
 
       // Check the annotated functions is a kernel function.
-      if (IsDeviceCompilation)
-      // TODO: Implement check for CUDA using nvvm.annotations metadata.
-#if ENABLE_HIP
-        if (Fn->getCallingConv() != CallingConv::AMDGPU_KERNEL)
+      if (IsDeviceCompilation) {
+        ModuleDeviceKernels = getDeviceKernels(M);
+        if (!isDeviceKernel(Fn))
           report_fatal_error(std::string{} + __FILE__ + ":" +
                              std::to_string(__LINE__) +
                              " => Expected the annotated Fn " + Fn->getName() +
                              " to be a kernel function!");
-#endif
+      }
 
       if (JitFunctionInfoMap.contains(Fn))
         report_fatal_error("Duplicate jit annotation for Fn " + Fn->getName(),
@@ -409,7 +442,7 @@ static void createJITModule(Module &M,
   //}
 
   // Internalize functions, besides JIT function, in the module
-  // to inline.
+  // to help global DCE (reduce compilation time), inlining.
   for (Function &JitModF : *JitMod) {
     if (JitModF.isDeclaration())
       continue;
@@ -508,8 +541,8 @@ static void createJITModule(Module &M,
 }
 
 static void
-createJITModuleSectionsDevice(Module &M,
-                              std::pair<Function *, JitFunctionInfo> &JITInfo) {
+createJITModuleDevice(Module &M,
+                      std::pair<Function *, JitFunctionInfo> &JITInfo) {
   ValueToValueMapTy VMap;
   Function *JITFn = JITInfo.first;
   JitFunctionInfo &JFI = JITInfo.second;
@@ -518,8 +551,9 @@ createJITModuleSectionsDevice(Module &M,
   // Need to remove all other __global__ functions in the module,
   // hipModuleLoadData expects a single kernel (__global__) in the image.
   auto JitMod = CloneModule(M, VMap, [&JITFn](const GlobalValue *GV) {
-    // Do not clone JIT bitcodes of other kernels.
-    if (GV->getSection().starts_with(".jit."))
+    // Do not clone JIT bitcodes of other kernels, assumes the existing special
+    // naming for globals storing the bitcodes.
+    if (GV->getName().starts_with("__jit_bc"))
       return false;
 
     if (const Function *F = dyn_cast<Function>(GV)) {
@@ -528,7 +562,7 @@ createJITModuleSectionsDevice(Module &M,
       // Do not clone other host-callable kernels.
       // TODO: Is this necessary when using hiprtc? In any case it reduces the
       // JITted code which should reduce compilation time.
-      if (F->getCallingConv() == CallingConv::AMDGPU_KERNEL)
+      if (isDeviceKernel(F))
         return false;
     }
 
@@ -544,7 +578,7 @@ createJITModuleSectionsDevice(Module &M,
   JitGlobalsToRemove.insert(JitGlobalAnnotations);
 
   for (auto &GV : JitMod->globals()) {
-    if (GV.getSection().starts_with(".jit."))
+    if (GV.getName().starts_with("__jit_bc"))
       JitGlobalsToRemove.insert(&GV);
   }
 
@@ -566,10 +600,8 @@ createJITModuleSectionsDevice(Module &M,
   DEBUG(dbgs() << "=== Pre DCE JIT IR\n"
                << *JitMod << "=== End of Pre DCE JIT IR\n");
 
-// TODO: is this necessary? Other tools could be performing it already.
-// Internalize functions, besides JIT function, in the module
-// to inline.
-#if 0
+  // Internalize functions, besides JIT function, in the module
+  // to help global DCE (reduce compilation time), inlining.
   for (Function &JitModF : *JitMod) {
     if (JitModF.isDeclaration())
       continue;
@@ -579,17 +611,26 @@ createJITModuleSectionsDevice(Module &M,
 
     // Internalize other functions in the module.
     JitModF.setLinkage(GlobalValue::InternalLinkage);
-    // F.setLinkage(GlobalValue::PrivateLinkage);
-    JitModF.removeFnAttr(Attribute::NoInline);
-    // F.addFnAttr(Attribute::InlineHint);
-    JitModF.addFnAttr(Attribute::AlwaysInline);
+    // JitModF.removeFnAttr(Attribute::NoInline);
+    //// F.addFnAttr(Attribute::InlineHint);
+    // JitModF.addFnAttr(Attribute::AlwaysInline);
   }
-#endif
 
   DEBUG(dbgs() << "=== Pre Passes JIT IR\n"
                << *JitMod << "=== End of Pre Passes JIT R\n");
 
   runCleanupPassPipeline(*JitMod);
+
+#if ENABLE_DEBUG
+  {
+    auto JITKernels = getDeviceKernels(*JitMod);
+    if (JITKernels.size() != 1)
+      report_fatal_error("Expected a single kernel in JIT module");
+  }
+
+#endif
+  // TODO: Decide whether to run optimization on the extracted module.
+  // runOptimizationPassPipeline(*JitMod);
 
   DEBUG(dbgs() << "=== Post Passes JIT IR\n"
                << *JitMod << "=== End of Post Passes JIT R\n");
@@ -637,14 +678,18 @@ createJITModuleSectionsDevice(Module &M,
 #if ENABLE_HIP
   GV->setSection(Twine(".jit." + JITFn->getName()).str());
 #endif
-  std::error_code EC;
-  raw_fd_ostream Output(
-      Twine("jit-" + JITFn->getName() + getUniqueModuleId(JitMod.get()) + ".bc")
-          .str(),
-      EC);
+#if ENABLE_DEBUG
+  {
+    std::error_code EC;
+    raw_fd_ostream Output(Twine("jit-" + JITFn->getName() +
+                                getUniqueModuleId(JitMod.get()) + ".bc")
+                              .str(),
+                          EC);
 
-  Output << JFI.ModuleIR;
-  Output.close();
+    Output << JFI.ModuleIR;
+    Output.close();
+  }
+#endif
 
   DEBUG(dbgs() << "=== Device Post M\n" << M << "=== End Device Post M\n");
 
@@ -956,12 +1001,12 @@ void visitor(Module &M, CallGraph &CG) {
   DEBUG(dbgs() << "=== Pre M\n" << M << "=== End of Pre M\n");
   if (isDeviceCompilation(M)) {
     for (auto &JFI : JitFunctionInfoMap)
-      createJITModuleSectionsDevice(M, JFI);
+      createJITModuleDevice(M, JFI);
 
     return;
   }
 
-  if (HasDeviceKernels(M))
+  if (HasDeviceKernelCalls(M))
     instrumentRegisterVar(M);
 
   // First pass creates the string Module IR per jit'ed function.
