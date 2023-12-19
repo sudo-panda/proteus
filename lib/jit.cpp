@@ -969,33 +969,36 @@ public:
 
       // Replace argument uses with runtime constants.
 #if ENABLE_RUNTIME_CONSTPROP
-      for (int I = 0; I < Node->getNumOperands(); ++I) {
-        ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
-        ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
-        int ArgNo = ConstInt->getZExtValue();
-        Value *Arg = F->getArg(ArgNo);
-        Type *ArgType = Arg->getType();
-        Constant *C = nullptr;
-        if (ArgType->isIntegerTy(32)) {
-          // dbgs() << "RC is Int32\n";
-          C = ConstantInt::get(ArgType, RC[I].Int32Val);
-        } else if (ArgType->isIntegerTy(64)) {
-          // dbgs() << "RC is Int64\n";
-          C = ConstantInt::get(ArgType, RC[I].Int64Val);
-        } else if (ArgType->isFloatTy()) {
-          // dbgs() << "RC is Float\n";
-          C = ConstantFP::get(ArgType, RC[I].FloatVal);
-        } else if (ArgType->isDoubleTy()) {
-          // dbgs() << "RC is Double\n";
-          C = ConstantFP::get(ArgType, RC[I].DoubleVal);
-        } else if (ArgType->isPointerTy()) {
-          auto *IntC = ConstantInt::get(Type::getInt64Ty(*Ctx), RC[I].Int64Val);
-          C = ConstantExpr::getIntToPtr(IntC, ArgType);
-        } else
-          FATAL_ERROR("JIT Incompatible type in runtime constant");
+      if (Config.ENV_RUNTIME_CONSTPROP)
+        for (int I = 0; I < Node->getNumOperands(); ++I) {
+          ConstantAsMetadata *CAM =
+              cast<ConstantAsMetadata>(Node->getOperand(I));
+          ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
+          int ArgNo = ConstInt->getZExtValue();
+          Value *Arg = F->getArg(ArgNo);
+          Type *ArgType = Arg->getType();
+          Constant *C = nullptr;
+          if (ArgType->isIntegerTy(32)) {
+            // dbgs() << "RC is Int32\n";
+            C = ConstantInt::get(ArgType, RC[I].Int32Val);
+          } else if (ArgType->isIntegerTy(64)) {
+            // dbgs() << "RC is Int64\n";
+            C = ConstantInt::get(ArgType, RC[I].Int64Val);
+          } else if (ArgType->isFloatTy()) {
+            // dbgs() << "RC is Float\n";
+            C = ConstantFP::get(ArgType, RC[I].FloatVal);
+          } else if (ArgType->isDoubleTy()) {
+            // dbgs() << "RC is Double\n";
+            C = ConstantFP::get(ArgType, RC[I].DoubleVal);
+          } else if (ArgType->isPointerTy()) {
+            auto *IntC =
+                ConstantInt::get(Type::getInt64Ty(*Ctx), RC[I].Int64Val);
+            C = ConstantExpr::getIntToPtr(IntC, ArgType);
+          } else
+            FATAL_ERROR("JIT Incompatible type in runtime constant");
 
-        Arg->replaceAllUsesWith(C);
-      }
+          Arg->replaceAllUsesWith(C);
+        }
 #endif
 
       DBG(dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n");
@@ -1003,23 +1006,26 @@ public:
       F->setName(FnName + Suffix);
 
 #if ENABLE_JIT_LAUNCH_BOUNDS
+      if (Config.ENV_JIT_LAUNCH_BOUNDS) {
 // TODO: Launch bounds for cuda.
 // TODO: Environment variable to enable launch bounds.
 #if ENABLE_HIP
-      // TODO: fix calculation of launch bounds.
-      // TODO: find maximum (hardcoded 1024) from device info.
-      // TODO: Setting as 1, BlockSize to replicate launch bounds settings
-      // Does setting it as BlockSize, BlockSize help?
-      F->addFnAttr("amdgpu-flat-work-group-size",
-                   "1," + std::to_string(std::min(1024, BlockSize)));
-      // TODO: find warp size (hardcoded 64) from device info.
-      // int WavesPerEU = (GridSize * BlockSize) / 64 / 110 / 4 / 2;
-      int WavesPerEU = 0;
-      // F->addFnAttr("amdgpu-waves-per-eu", std::to_string(WavesPerEU));
-      DBG(dbgs() << "BlockSize " << BlockSize << " GridSize " << GridSize
-                 << " => Set Wokgroup size " << BlockSize
-                 << " WavesPerEU (unused) " << WavesPerEU << "\n");
+        // TODO: fix calculation of launch bounds.
+        // TODO: find maximum (hardcoded 1024) from device info.
+        // TODO: Setting as 1, BlockSize to replicate launch bounds settings
+        // Does setting it as BlockSize, BlockSize help?
+        F->addFnAttr("amdgpu-flat-work-group-size",
+                     "1," + std::to_string(std::min(1024, BlockSize)));
+        // TODO: find warp size (hardcoded 64) from device info.
+        // int WavesPerEU = (GridSize * BlockSize) / 64 / 110 / 4 / 2;
+        int WavesPerEU = 0;
+        // F->addFnAttr("amdgpu-waves-per-eu", std::to_string(WavesPerEU));
+        DBG(dbgs() << "BlockSize " << BlockSize << " GridSize " << GridSize
+                   << " => Set Wokgroup size " << BlockSize
+                   << " WavesPerEU (unused) " << WavesPerEU << "\n");
+
 #endif
+      }
 #endif
 
 #if ENABLE_DEBUG
@@ -1295,18 +1301,20 @@ public:
           HipFunction, GridDim.x, GridDim.y, GridDim.z, BlockDim.x, BlockDim.y,
           BlockDim.z, ShmemSize, (hipStream_t)Stream, KernelArgs, nullptr);
 
-    if ((HipFunction = StoredCache.lookup(HashValue, KernelName))) {
-      CodeCache.insert(HashValue, HipFunction
+    if (Config.ENV_USE_STORED_CACHE)
+      if ((HipFunction = StoredCache.lookup(HashValue, KernelName))) {
+        CodeCache.insert(HashValue, HipFunction
 #if ENABLE_DEBUG
-                       ,
-                       KernelName, RC, NumRuntimeConstants
+                         ,
+                         KernelName, RC, NumRuntimeConstants
 #endif
-      );
+        );
 
-      return hipModuleLaunchKernel(
-          HipFunction, GridDim.x, GridDim.y, GridDim.z, BlockDim.x, BlockDim.y,
-          BlockDim.z, ShmemSize, (hipStream_t)Stream, KernelArgs, nullptr);
-    }
+        return hipModuleLaunchKernel(HipFunction, GridDim.x, GridDim.y,
+                                     GridDim.z, BlockDim.x, BlockDim.y,
+                                     BlockDim.z, ShmemSize, (hipStream_t)Stream,
+                                     KernelArgs, nullptr);
+      }
 #elif ENABLE_CUDA
     CUfunction CUFunc = CodeCache.lookup(HashValue);
     if (CUFunc) {
@@ -1396,7 +1404,7 @@ public:
 #endif
     StringRef CodeRef(reinterpret_cast<char *>(BinOut), BinSize);
 
-    {
+    if (Config.ENV_USE_STORED_CACHE) {
       std::error_code EC;
       raw_fd_ostream OutBin(
           Twine("cache-jit-" + std::to_string(HashValue) + ".o").str(), EC);
@@ -1452,9 +1460,26 @@ private:
 
     DBG(dbgs() << "CUDA Arch " << CudaArch << "\n");
 #endif
+
+    Config.ENV_JIT_LAUNCH_BOUNDS =
+        getEnvOrDefaultBool("ENV_JIT_LAUNCH_BOUNDS", true);
+    Config.ENV_USE_STORED_CACHE =
+        getEnvOrDefaultBool("ENV_USE_STORED_CACHE", true);
+    Config.ENV_RUNTIME_CONSTPROP =
+        getEnvOrDefaultBool("ENV_RUNTIME_CONSTPROP", true);
+  }
+
+  bool getEnvOrDefaultBool(const char *VarName, bool Default) {
+    const char *EnvValue = std::getenv(VarName);
+    return EnvValue ? static_cast<bool>(std::stoi(EnvValue)) : Default;
   }
 
   std::unordered_map<std::string, const void *> VarNameToDevPtr;
+  struct {
+    bool ENV_JIT_LAUNCH_BOUNDS;
+    bool ENV_USE_STORED_CACHE;
+    bool ENV_RUNTIME_CONSTPROP;
+  } Config;
 #if ENABLE_HIP
   JitCache<hipFunction_t> CodeCache;
   JitStoredCache<hipFunction_t> StoredCache;
