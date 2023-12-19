@@ -707,6 +707,10 @@ static void emitJITKernelEntry(Module &M,
   Type *Int32Ty = Type::getInt32Ty(M.getContext());
   StructType *RuntimeConstantTy = StructType::create({Int64Ty}, "struct.args");
 
+  GlobalVariable *ModuleUniqueId =
+      M.getGlobalVariable("__module_unique_id", true);
+  assert(ModuleUniqueId && "Expected ModuleUniqueId global to be defined");
+
 #if ENABLE_HIP
   GlobalVariable *FatbinWrapper =
       M.getGlobalVariable("__hip_fatbin_wrapper", true);
@@ -737,7 +741,7 @@ static void emitJITKernelEntry(Module &M,
 #if ENABLE_HIP
   FunctionType *JitEntryFnTy = FunctionType::get(
       Int32Ty,
-      {VoidPtrTy, FatbinWrapper->getType(), Int64Ty,
+      {ModuleUniqueId->getType(), VoidPtrTy, FatbinWrapper->getType(), Int64Ty,
        RuntimeConstantTy->getPointerTo(), Int32Ty, Int64Ty, Int32Ty, Int64Ty,
        Int32Ty, VoidPtrTy, Int64Ty, VoidPtrTy},
       /* isVarArg=*/false);
@@ -745,7 +749,7 @@ static void emitJITKernelEntry(Module &M,
   // NOTE: CUDA uses an array type for passing grid, block sizes.
   FunctionType *JitEntryFnTy = FunctionType::get(
       Int32Ty,
-      {VoidPtrTy, FatbinWrapper->getType(), Int64Ty,
+      {ModuleUniqueId->getType(), VoidPtrTy, FatbinWrapper->getType(), Int64Ty,
        RuntimeConstantTy->getPointerTo(), Int32Ty, ArrayType::get(Int64Ty, 2),
        ArrayType::get(Int64Ty, 2), VoidPtrTy, Int64Ty, VoidPtrTy},
       /* isVarArg=*/false);
@@ -806,7 +810,7 @@ static void emitJITKernelEntry(Module &M,
 #ifdef ENABLE_HIP
   auto *Ret = Builder.CreateCall(
       JitEntryFn,
-      {StubToKernelMap[JITFn], FatbinWrapper,
+      {ModuleUniqueId, StubToKernelMap[JITFn], FatbinWrapper,
        /* FatbinSize unused by HIP */ Builder.getInt64(0),
        RuntimeConstantsAlloca, Builder.getInt32(JFI.ConstantArgs.size()),
        LaunchKernelCall->getArgOperand(1), LaunchKernelCall->getArgOperand(2),
@@ -816,8 +820,9 @@ static void emitJITKernelEntry(Module &M,
 #elif ENABLE_CUDA
   auto *Ret = Builder.CreateCall(
       JitEntryFn,
-      {StubToKernelMap[JITFn], FatbinWrapper, Builder.getInt64(FatbinSize),
-       RuntimeConstantsAlloca, Builder.getInt32(JFI.ConstantArgs.size()),
+      {ModuleUniqueId, StubToKernelMap[JITFn], FatbinWrapper,
+       Builder.getInt64(FatbinSize), RuntimeConstantsAlloca,
+       Builder.getInt32(JFI.ConstantArgs.size()),
        LaunchKernelCall->getArgOperand(1), LaunchKernelCall->getArgOperand(2),
        LaunchKernelCall->getArgOperand(3), LaunchKernelCall->getArgOperand(4),
        LaunchKernelCall->getArgOperand(5)});
@@ -899,6 +904,17 @@ static void instrumentRegisterVar(Module &M) {
       Value *SymbolName = CB->getArgOperand(2);
       Builder.CreateCall(JitRegisterVarFn, {GV, SymbolName});
     }
+}
+
+static GlobalVariable *emitModuleUniqueIdGlobal(Module &M) {
+  Constant *ModuleUniqueId =
+      ConstantDataArray::getString(M.getContext(), getUniqueModuleId(&M));
+  auto *GV = new GlobalVariable(M, ModuleUniqueId->getType(), true,
+                                GlobalValue::PrivateLinkage, ModuleUniqueId,
+                                "__module_unique_id");
+  appendToUsed(M, {GV});
+
+  return GV;
 }
 
 static void
@@ -1006,8 +1022,10 @@ void visitor(Module &M, CallGraph &CG) {
     return;
   }
 
-  if (HasDeviceKernelCalls(M))
+  if (HasDeviceKernelCalls(M)) {
     instrumentRegisterVar(M);
+    emitModuleUniqueIdGlobal(M);
+  }
 
   // First pass creates the string Module IR per jit'ed function.
   for (auto &JFI : JitFunctionInfoMap) {

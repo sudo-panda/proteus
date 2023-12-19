@@ -45,6 +45,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <filesystem>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -266,7 +267,8 @@ struct RuntimeConstant {
     int64_t Int64Val;
     float FloatVal;
     double DoubleVal;
-    void *PtrVal; // TODO: think
+    // TODO: This allows pointer as runtime constant values. How useful is that?
+    void *PtrVal;
   };
 };
 
@@ -277,12 +279,124 @@ inline hash_code hash_value(const RuntimeConstant &RC) {
 // TODO: check if this global is needed.
 static codegen::RegisterCodeGenFlags CFG;
 
+struct Codegen {
+  static void relinkGlobals(
+      Module &M,
+      std::unordered_map<std::string, const void *> &VarNameToDevPtr) {
+    // Re-link globals to fixed addresses provided by registered
+    // variables.
+    for (auto RegisterVar : VarNameToDevPtr) {
+#if ENABLE_HIP
+      const void *DevPtr = RegisterVar.second;
+#elif ENABLE_CUDA
+      // For CUDA we must defer resolving the global symbol address here
+      // instead when registering the variable in the constructor context.
+      void *DevPtr = nullptr;
+      cudaErrCheck(cudaGetSymbolAddress(&DevPtr, RegisterVar.second));
+#else
+#error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
+#endif
+      assert(DevPtr && "Expected non-null device pointer for global");
+      auto &VarName = RegisterVar.first;
+      auto *GV = M.getNamedGlobal(VarName);
+      assert(GV && "Expected existing global variable");
+      // Remove the re-linked global from llvm.compiler.used since that
+      // use is not replaceable by the fixed addr constant expression.
+      removeFromUsedLists(M, [&GV](Constant *C) {
+        if (GV == C)
+          return true;
+
+        return false;
+      });
+
+      Constant *Addr =
+          ConstantInt::get(Type::getInt64Ty(M.getContext()), (uint64_t)DevPtr);
+      Value *CE = ConstantExpr::getIntToPtr(Addr, GV->getType());
+      GV->replaceAllUsesWith(CE);
+    }
+
+#if ENABLE_DEBUG
+    dbgs() << "=== Linked M\n" << *M << "=== End of Linked M\n";
+    if (verifyModule(*M, &errs()))
+      FATAL_ERROR(
+          "After linking, broken module found, JIT compilation aborted!");
+    else
+      dbgs() << "Module verified!\n";
+#endif
+  }
+};
+
+// NOTE: Stored cache assumes that stored code is re-usable across runs!
+// Source code changes should invalidate the cache (TODO). Also, if
+// storing assembly (PTX) or binary (ELF), then device globals may
+// have different addresses that render it invalid. In this case, store LLVM IR
+// to re-link globals.
+template <typename Function_t> class JitStoredCache {
+public:
+  Function_t lookup(uint64_t HashValue, StringRef Kernel) {
+    TIMESCOPE("object lookup");
+    Accesses++;
+
+    Function_t DevFunction;
+#if ENABLE_LLVMIR_STORED_CACHE
+#error Unsupported yet
+#endif
+#if ENABLE_HIP
+    hipModule_t HipModule;
+    //  Load module from file.
+    auto Err = hipModuleLoad(
+        &HipModule, ("cache-jit-" + std::to_string(HashValue) + ".o").c_str());
+    if (Err == hipErrorFileNotFound)
+      return nullptr;
+
+    hipErrCheck(Err);
+
+    // Get function from loaded module.
+    const std::string Suffix = "$jit$" + std::to_string(HashValue) + "$";
+    const std::string KernelMangled = Kernel.str() + Suffix;
+
+    hipErrCheck(
+        hipModuleGetFunction(&DevFunction, HipModule, KernelMangled.c_str()));
+#elif ENABLE_CUDA
+    CUmodule CUMod;
+    auto Err = cuModuleLoad(
+        &CUMod, ("cache-jit-" + std::to_string(HashValue) + ".o").c_str());
+
+    if (Err == CUDA_ERROR_FILE_NOT_FOUND)
+      return nullptr;
+
+    cuErrCheck(Err);
+
+    // Get function from loaded module.
+    const std::string Suffix = "$jit$" + std::to_string(HashValue) + "$";
+    const std::string KernelMangled = Kernel.str() + Suffix;
+
+    cuErrCheck(cuModuleGetFunction(&DevFunction, CUMod, KernelMangled.c_str()));
+#else
+#error "Expected ENABLE_HIP or ENABLE_CUDA to be defined'
+#endif
+
+    // Return function.
+    Hits++;
+    return DevFunction;
+  }
+
+  void printStats() {
+    // Use printf to avoid re-ordering outputs by outs() in HIP.
+    printf("JitStoredCache hits %lu total %lu\n", Hits, Accesses);
+  }
+
+private:
+  uint64_t Hits = 0;
+  uint64_t Accesses = 0;
+};
+
 template <typename Function_t> class JitCache {
 public:
-  uint64_t hash(StringRef FnName, RuntimeConstant *RC,
-                int NumRuntimeConstants) {
+  uint64_t hash(StringRef ModuleUniqueId, StringRef FnName,
+                const RuntimeConstant *RC, int NumRuntimeConstants) const {
     ArrayRef<RuntimeConstant> Data(RC, NumRuntimeConstants);
-    auto HashValue = hash_combine(FnName, Data);
+    auto HashValue = hash_combine(ExePath, ModuleUniqueId, FnName, Data);
     return HashValue;
   }
 
@@ -295,6 +409,7 @@ public:
       return nullptr;
 
     It->second.NumExecs++;
+    It->second.NumHits++;
     Hits++;
     return It->second.FunctionPtr;
   }
@@ -326,8 +441,10 @@ public:
     for (auto &It : CacheMap) {
       uint64_t HashValue = It.first;
       JitCacheEntry &JCE = It.second;
-      // outs() << "HashValue " << HashValue << " num_execs " << JCE.NumExecs;
-      printf("HashValue %lu num_execs %lu", HashValue, JCE.NumExecs);
+      // outs() << "HashValue " << HashValue << " num_execs " <<
+      // JCE.NumExecs;
+      printf("HashValue %lu NumExecs %lu NumHits %lu", HashValue, JCE.NumExecs,
+             JCE.NumHits);
 #if ENABLE_DEBUG
       // outs() << " FnName " << JCE.FnName << " RCs [";
       printf(" FnName %s RCs [", JCE.FnName.c_str());
@@ -342,10 +459,16 @@ public:
     }
   }
 
+  JitCache() {
+    // NOTE: Linux-specific.
+    ExePath = std::filesystem::canonical("/proc/self/exe");
+  }
+
 private:
   struct JitCacheEntry {
     Function_t FunctionPtr;
     uint64_t NumExecs;
+    uint64_t NumHits;
 #if ENABLE_DEBUG
     std::string FnName;
     SmallVector<RuntimeConstant, 8> RCVector;
@@ -353,6 +476,9 @@ private:
   };
 
   DenseMap<uint64_t, JitCacheEntry> CacheMap;
+  // Use the executable binary path when hashing to differentiate between
+  // same-named kernels generated by other executables.
+  std::filesystem::path ExePath;
   uint64_t Hits = 0;
   uint64_t Accesses = 0;
 };
@@ -424,7 +550,8 @@ public:
     SMDiagnostic Err;
     if (auto M = parseIR(MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()),
                          Err, *Ctx)) {
-      // dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n";
+      // dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed
+      // Module\n";
       Function *F = M->getFunction(FnName);
       assert(F && "Expected non-null function!");
       MDNode *Node = F->getMetadata("jit_arg_nos");
@@ -432,6 +559,7 @@ public:
                  << "\n");
 
       // Replace argument uses with runtime constants.
+      // TODO: Env var to enable runtime constprop.
 #if ENABLE_RUNTIME_CONSTPROP
       for (int I = 0; I < Node->getNumOperands(); ++I) {
         ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
@@ -621,6 +749,34 @@ struct FatbinWrapper_t {
   void *X;
 };
 
+static void runOptimizationPassPipeline(Module &M, StringRef CPU) {
+  PipelineTuningOptions PTO;
+
+  std::optional<PGOOptions> PGOOpt;
+  auto TM = createTargetMachine(M, CPU);
+  if (auto Err = TM.takeError())
+    report_fatal_error(std::move(Err));
+  TargetLibraryInfoImpl TLII(Triple(M.getTargetTriple()));
+
+  PassBuilder PB(TM->get(), PTO, PGOOpt, nullptr);
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+
+  FAM.registerPass([&] { return TargetLibraryAnalysis(TLII); });
+
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  ModulePassManager Passes =
+      PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+  Passes.run(M, MAM);
+}
+
 class JitEngineDevice {
 public:
   static JitEngineDevice &instance() {
@@ -628,7 +784,10 @@ public:
     return Jit;
   }
 
-  ~JitEngineDevice() { CodeCache.printStats(); }
+  ~JitEngineDevice() {
+    CodeCache.printStats();
+    StoredCache.printStats();
+  }
 
   std::unique_ptr<MemoryBuffer> extractDeviceBitcodeHip(StringRef KernelName,
                                                         const char *Binary) {
@@ -679,7 +838,6 @@ public:
       raw_fd_ostream OutBin("device.bin", EC);
       if (EC)
         FATAL_ERROR("Cannot open device binary file");
-      // TODO: Remove or leave it only for debugging.
       OutBin << DeviceBinary;
       OutBin.close();
       dbgs() << "Binary image found\n";
@@ -695,9 +853,9 @@ public:
     if (Sections.takeError())
       FATAL_ERROR("Error reading sections");
 
-    // NOTE: We must extract the .jit sections per kernel to avoid linked device
-    // libraries. Otherwise, the hiprtc linker complains that it cannot link
-    // device libraries (working assumption).
+    // NOTE: We must extract the .jit sections per kernel to avoid linked
+    // device libraries. Otherwise, the hiprtc linker complains that it
+    // cannot link device libraries (working assumption).
     ArrayRef<uint8_t> DeviceBitcode;
     Twine TargetSection = ".jit." + KernelName;
     for (auto Section : *Sections) {
@@ -725,7 +883,6 @@ public:
       raw_fd_ostream OutBC(Twine(".jit." + KernelName + ".bc").str(), EC);
       if (EC)
         FATAL_ERROR("Cannot open device bitcode file");
-      // TODO: Remove or leave it only for debugging.
       OutBC << StringRef(reinterpret_cast<const char *>(DeviceBitcode.data()),
                          DeviceBitcode.size());
       OutBC.close();
@@ -747,9 +904,9 @@ public:
     size_t Bytes;
     std::string Symbol = Twine("__jit_bc_" + KernelName).str();
 
-    // NOTE: loading a module OR getting the global fails if rdc compilation is
-    // enabled. Try to use the linker interface to load the binary image. If
-    // that fails too, abort.
+    // NOTE: loading a module OR getting the global fails if rdc compilation
+    // is enabled. Try to use the linker interface to load the binary image.
+    // If that fails too, abort.
     // TODO: detect rdc compilation in the JitPass, see
     // __cudaRegisterLinkedLibrary or __nv_relfatbin section existences.
     if (cuModuleLoadFatBinary(&CUMod, Binary) != CUDA_SUCCESS ||
@@ -769,6 +926,7 @@ public:
     SmallString<4096> DeviceBitcode;
     DeviceBitcode.reserve(Bytes);
     cuErrCheck(cuMemcpyDtoH(DeviceBitcode.data(), DevPtr, Bytes));
+#ifdef ENABLE_DEBUG
     {
       std::error_code EC;
       raw_fd_ostream OutBC(Twine("from-device-jit-" + KernelName + ".bc").str(),
@@ -778,6 +936,7 @@ public:
       OutBC << StringRef(DeviceBitcode.data(), Bytes);
       OutBC.close();
     }
+#endif
 
     cuErrCheck(cuModuleUnload(CUMod));
     if (CULinkState)
@@ -805,47 +964,10 @@ public:
       DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node
                  << "\n");
 
-      // Re-link globals to fixed addresses provided by registered variables.
-      for (auto RegisterVar : VarNameToDevPtr) {
-#if ENABLE_HIP
-        const void *DevPtr = RegisterVar.second;
-#elif ENABLE_CUDA
-        // For CUDA we must defer resolving the global symbol address here
-        // instead when registering the variable in the constructor context.
-        void *DevPtr = nullptr;
-        cudaErrCheck(cudaGetSymbolAddress(&DevPtr, RegisterVar.second));
-#else
-#error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
-#endif
-        assert(DevPtr && "Expected non-null device pointer for global");
-        auto &VarName = RegisterVar.first;
-        auto *GV = M->getNamedGlobal(VarName);
-        assert(GV && "Expected existing global variable");
-        // Remove the re-linked global from llvm.compiler.used since that use
-        // is not replaceable by the fixed addr constant expression.
-        removeFromUsedLists(*M, [&GV](Constant *C) {
-          if (GV == C)
-            return true;
+      // Relink device globals.
+      Codegen::relinkGlobals(*M, VarNameToDevPtr);
 
-          return false;
-        });
-
-        Constant *Addr =
-            ConstantInt::get(Type::getInt64Ty(*Ctx), (uint64_t)DevPtr);
-        Value *CE = ConstantExpr::getIntToPtr(Addr, GV->getType());
-        GV->replaceAllUsesWith(CE);
-      }
-
-#if ENABLE_DEBUG
-      dbgs() << "=== Linked M\n" << *M << "=== End of Linked M\n";
-      if (verifyModule(*M, &errs()))
-        FATAL_ERROR(
-            "After linking, broken module found, JIT compilation aborted!");
-      else
-        dbgs() << "Module verified!\n";
-#endif
-
-        // Replace argument uses with runtime constants.
+      // Replace argument uses with runtime constants.
 #if ENABLE_RUNTIME_CONSTPROP
       for (int I = 0; I < Node->getNumOperands(); ++I) {
         ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
@@ -881,6 +1003,8 @@ public:
       F->setName(FnName + Suffix);
 
 #if ENABLE_JIT_LAUNCH_BOUNDS
+// TODO: Launch bounds for cuda.
+// TODO: Environment variable to enable launch bounds.
 #if ENABLE_HIP
       // TODO: fix calculation of launch bounds.
       // TODO: find maximum (hardcoded 1024) from device info.
@@ -912,23 +1036,48 @@ public:
   }
 
 #if ENABLE_HIP
-  hipError_t codegenAndLaunchHip(Module *M, StringRef KernelName,
-                                 StringRef Suffix, uint64_t HashValue,
-                                 RuntimeConstant *RC, int NumRuntimeConstants,
-                                 dim3 GridDim, dim3 BlockDim, void **KernelArgs,
-                                 uint64_t ShmemSize, hipStream_t Stream) {
+  hipError_t codegenAndLaunchHip(Module *M, StringRef HipArch,
+                                 StringRef KernelName, StringRef Suffix,
+                                 uint64_t HashValue, RuntimeConstant *RC,
+                                 int NumRuntimeConstants, void **BinOut,
+                                 size_t &BinSize, dim3 GridDim, dim3 BlockDim,
+                                 void **KernelArgs, uint64_t ShmemSize,
+                                 hipStream_t Stream) {
+    // Remove extras to get a working CPU architecture value, e.g., from
+    // gfx90a:sramecc+:xnack- drop everything after the first :.
+    // HipArch = HipArch.substr(0, HipArch.find_first_of(":"));
+    // TODO: Do not run optimization pipeline for hip, hiprtc adds O3 by
+    // default. Also, need to fine-tune the pipeline: issue with libor where
+    // aggressive unrolling creates huge, slow binary code.
+    // runOptimizationPassPipeline(*M, HipArch);
+#if ENABLE_DEBUG
+    {
+      if (verifyModule(*M, &errs()))
+        FATAL_ERROR("Broken module found after optimization, JIT "
+                    "compilation aborted!");
+      std::error_code EC;
+      raw_fd_ostream OutBC(
+          Twine("opt-transformed-jit-" + KernelName + Suffix + ".bc").str(),
+          EC);
+      if (EC)
+        FATAL_ERROR("Cannot open device transformed bitcode file");
+      // TODO: Remove or leave it only for debugging.
+      OutBC << *M;
+      OutBC.close();
+    }
+#endif
+
     SmallString<4096> ModuleBuffer;
     raw_svector_ostream ModuleBufferOS(ModuleBuffer);
-    ModuleBufferOS << *M;
-    // WriteBitcodeToFile(*M, ModuleBufferOS);
+    WriteBitcodeToFile(*M, ModuleBufferOS);
 
     hipModule_t HipModule;
 
     hiprtcLinkState hip_link_state_ptr;
 
-    // TODO: Dynamic linking is to be supported through hiprtc. Currently the
-    // interface is limited and lacks support for linking globals. Indicative
-    // code here is for future re-visit.
+    // TODO: Dynamic linking is to be supported through hiprtc. Currently
+    // the interface is limited and lacks support for linking globals.
+    // Indicative code here is for future re-visit.
 #if DYNAMIC_LINK
     std::vector<hiprtcJIT_option> LinkOptions = {
         HIPRTC_JIT_GLOBAL_SYMBOL_NAMES, HIPRTC_JIT_GLOBAL_SYMBOL_ADDRESS,
@@ -956,48 +1105,43 @@ public:
         LinkOptions.size(), LinkOptions.data(), (void **)&LinkOptionsValues));
 #endif
 
-    void *BinOut;
-    size_t BinSize;
     {
       TIMESCOPE("Device linker");
+// #if CUSTOM_OPTIONS
+// TODO: Toggle this with an env var.
+#if 1
+      // NOTE: This code is an example of passing custom, AMD-specific
+      // options to the compiler/linker. NOTE: Unrolling can have a dramatic
+      // (time-consuming) effect on JIT compilation time and on the
+      // resulting optimization, better or worse depending on code
+      // specifics. const char *OptArgs[] = {"-mllvm",
+      // "-amdgpu-internalize-symbols",
+      //                         "-save-temps", "-mllvm",
+      //                         "-unroll-threshold=100"};
+      const char *OptArgs[] = {"-mllvm", "-amdgpu-internalize-symbols",
+                               "-mllvm", "-unroll-threshold=1000",
+                               "-march=gfx90a"};
+      std::vector<hiprtcJIT_option> JITOptions = {
+          HIPRTC_JIT_IR_TO_ISA_OPT_EXT, HIPRTC_JIT_IR_TO_ISA_OPT_COUNT_EXT};
+      size_t OptArgsSize = 5;
+      const void *JITOptionsValues[] = {(void *)OptArgs, (void *)(OptArgsSize)};
+      hiprtcErrCheck(hiprtcLinkCreate(JITOptions.size(), JITOptions.data(),
+                                      (void **)JITOptionsValues,
+                                      &hip_link_state_ptr));
+#else
       hiprtcErrCheck(
           hiprtcLinkCreate(0, nullptr, nullptr, &hip_link_state_ptr));
-
-#if CUSTOM_OPTIONS
-      // NOTE: This code is an example of passing custom, AMD-specific options
-      // to the compiler/linker.
-      const char *isaopts[] = {"-mllvm", "-amdgpu-internalize-symbols",
-                               "-save-temps"};
-      std::vector<hiprtcJIT_option> jit_options = {
-          HIPRTC_JIT_IR_TO_ISA_OPT_EXT, HIPRTC_JIT_IR_TO_ISA_OPT_COUNT_EXT};
-      size_t isaoptssize = 3;
-      const void *lopts[] = {(void *)isaopts, (void *)(isaoptssize)};
-      hiprtcErrCheck(hiprtcLinkCreate(2, jit_options.data(), (void **)lopts,
-                                      &hip_link_state_ptr));
 #endif
 
       hiprtcErrCheck(
           hiprtcLinkAddData(hip_link_state_ptr, HIPRTC_JIT_INPUT_LLVM_BITCODE,
                             (void *)ModuleBuffer.data(), ModuleBuffer.size(),
                             KernelName.data(), 0, nullptr, nullptr));
-      hiprtcErrCheck(hiprtcLinkComplete(hip_link_state_ptr, &BinOut, &BinSize));
-#if ENABLE_DEBUG
-      {
-        std::error_code EC;
-        raw_fd_ostream OutBin(Twine("object-.jit." + KernelName + ".o").str(),
-                              EC);
-        if (EC)
-          FATAL_ERROR("Cannot open device object file");
-        // TODO: Remove or leave it only for debugging.
-        StringRef S(reinterpret_cast<char *>(BinOut), BinSize);
-        OutBin << S;
-        OutBin.close();
-      }
-#endif
+      hiprtcErrCheck(hiprtcLinkComplete(hip_link_state_ptr, BinOut, &BinSize));
     }
     {
       TIMESCOPE("Load module");
-      hipErrCheck(hipModuleLoadData(&HipModule, BinOut));
+      hipErrCheck(hipModuleLoadData(&HipModule, *BinOut));
     }
 
     hipFunction_t HipFunction;
@@ -1020,52 +1164,96 @@ public:
 #endif
 
 #if ENABLE_CUDA
-  cudaError_t codegenAndLaunchCuda(Module *M, StringRef CudaArch,
-                                   StringRef KernelName, StringRef Suffix,
-                                   uint64_t HashValue, RuntimeConstant *RC,
-                                   int NumRuntimeConstants, dim3 GridDim,
-                                   dim3 BlockDim, void **KernelArgs,
-                                   uint64_t ShmemSize, CUstream Stream) {
-    // Codegen PTX, load the module and run through the CUDA PTX JIT
-    // interface. Check this reference for JIT caching:
-    // https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
-    // Interesting env vars: CUDA_CACHE_DISABLE, CUDA_CACHE_MAXSIZE,
-    // CUDA_CACHE_PATH, CUDA_FORCE_PTX_JIT.
-    CUmodule CUMod;
 
-    auto TMExpected = createTargetMachine(*M, CudaArch);
+  void codegenPTX(Module &M, StringRef CudaArch,
+                  SmallVectorImpl<char> &PTXStr) {
+    auto TMExpected = createTargetMachine(M, CudaArch);
     if (!TMExpected)
       FATAL_ERROR(toString(TMExpected.takeError()));
 
     std::unique_ptr<TargetMachine> TM = std::move(*TMExpected);
-    TargetLibraryInfoImpl TLII(Triple(M->getTargetTriple()));
+    TargetLibraryInfoImpl TLII(Triple(M.getTargetTriple()));
 
     legacy::PassManager PM;
     PM.add(new TargetLibraryInfoWrapperPass(TLII));
     MachineModuleInfoWrapperPass *MMIWP = new MachineModuleInfoWrapperPass(
         reinterpret_cast<LLVMTargetMachine *>(TM.get()));
 
-    SmallString<4096> PtxStr;
-    raw_svector_ostream PtxOS(PtxStr);
-    TM->addPassesToEmitFile(PM, PtxOS, nullptr, CGFT_AssemblyFile,
+    raw_svector_ostream PTXOS(PTXStr);
+    TM->addPassesToEmitFile(PM, PTXOS, nullptr, CGFT_AssemblyFile,
                             /* DisableVerify */ false, MMIWP);
 
-    PM.run(*M);
+    PM.run(M);
+  }
+
+  cudaError_t codegenAndLaunchCuda(
+      Module *M, StringRef CudaArch, StringRef KernelName, StringRef Suffix,
+      uint64_t HashValue, RuntimeConstant *RC, int NumRuntimeConstants,
+      SmallVectorImpl<char> &FinalIR, SmallVectorImpl<char> &PTXStr,
+      void **BinOut, std::size_t &BinSize, dim3 GridDim, dim3 BlockDim,
+      void **KernelArgs, uint64_t ShmemSize, CUstream Stream) {
+    // Codegen PTX, load the module and run through the CUDA PTX JIT
+    // interface. Check this reference for JIT caching:
+    // https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
+    // Interesting env vars: CUDA_CACHE_DISABLE, CUDA_CACHE_MAXSIZE,
+    // CUDA_CACHE_PATH, CUDA_FORCE_PTX_JIT.
+    // For CUDA, run the target-specific optimization pipeline to optimize the
+    // LLVM IR before handing over to the CUDA driver PTX compiler.
+    runOptimizationPassPipeline(*M, CudaArch);
 
 #if ENABLE_DEBUG
     {
+      if (verifyModule(*M, &errs()))
+        FATAL_ERROR("Broken module found after optimization, JIT "
+                    "compilation aborted!");
       std::error_code EC;
-      raw_fd_ostream OutPtx(Twine("jit-" + KernelName + ".ptx").str(), EC);
+      raw_fd_ostream OutBC(
+          Twine("opt-transformed-jit-" + KernelName + Suffix + ".bc").str(),
+          EC);
+      if (EC)
+        FATAL_ERROR("Cannot open device transformed bitcode file");
+      OutBC << *M;
+      OutBC.close();
+    }
+#endif
+
+    codegenPTX(*M, CudaArch, PTXStr);
+
+// #if ENABLE_DEBUG
+#if 1
+    {
+      std::error_code EC;
+      raw_fd_ostream OutPtx(
+          Twine("jit-" + std::to_string(HashValue) + ".ptx").str(), EC);
       if (EC)
         FATAL_ERROR("Cannot open ptx output file");
-      // TODO: Remove or leave it only for debugging.
-      OutPtx << PtxStr;
+      OutPtx << PTXStr;
       OutPtx.close();
     }
 #endif
 
-    cuErrCheck(cuModuleLoadData(&CUMod, PtxStr.c_str()));
+    CUmodule CUMod;
     CUfunction CUFunc;
+    // CUDA requires null-terminated PTX.
+    // PTXStr.push_back('\0');
+#if ENABLE_LLVMIR_STORED_CACHE
+    {
+      raw_svector_ostream IROS(FinalIR);
+      WriteBitcodeToFile(*M, IROS);
+    }
+#elif ENABLE_CUDA_PTX_STORED_CACHE
+    cuErrCheck(cuModuleLoadData(&CUMod, PTXStr.data()));
+    cuErrCheck(cuModuleGetFunction(&CUFunc, CUMod,
+                                   Twine(KernelName + Suffix).str().c_str()));
+#endif
+    CUlinkState CULinkState;
+    cuErrCheck(cuLinkCreate(0, nullptr, nullptr, &CULinkState));
+    cuErrCheck(cuLinkAddData(CULinkState, CU_JIT_INPUT_PTX,
+                             (void *)PTXStr.data(), PTXStr.size(), "", 0, 0,
+                             0));
+    cuErrCheck(cuLinkComplete(CULinkState, BinOut, &BinSize));
+
+    cuErrCheck(cuModuleLoadData(&CUMod, *BinOut));
     cuErrCheck(cuModuleGetFunction(&CUFunc, CUMod,
                                    Twine(KernelName + Suffix).str().c_str()));
 
@@ -1091,22 +1279,51 @@ public:
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined'
 #endif
-  compileAndRun(StringRef KernelName, FatbinWrapper_t *FatbinWrapper,
-                size_t FatbinSize, RuntimeConstant *RC, int NumRuntimeConstants,
-                dim3 GridDim, dim3 BlockDim, void **KernelArgs,
-                uint64_t ShmemSize, void *Stream) {
+  compileAndRun(StringRef ModuleUniqueId, StringRef KernelName,
+                FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
+                RuntimeConstant *RC, int NumRuntimeConstants, dim3 GridDim,
+                dim3 BlockDim, void **KernelArgs, uint64_t ShmemSize,
+                void *Stream) {
     TIMESCOPE("compileAndRun");
 
-    uint64_t HashValue = CodeCache.hash(KernelName, RC, NumRuntimeConstants);
+    uint64_t HashValue =
+        CodeCache.hash(ModuleUniqueId, KernelName, RC, NumRuntimeConstants);
 #if ENABLE_HIP
     hipFunction_t HipFunction = CodeCache.lookup(HashValue);
     if (HipFunction)
       return hipModuleLaunchKernel(
           HipFunction, GridDim.x, GridDim.y, GridDim.z, BlockDim.x, BlockDim.y,
           BlockDim.z, ShmemSize, (hipStream_t)Stream, KernelArgs, nullptr);
+
+    if ((HipFunction = StoredCache.lookup(HashValue, KernelName))) {
+      CodeCache.insert(HashValue, HipFunction
+#if ENABLE_DEBUG
+                       ,
+                       KernelName, RC, NumRuntimeConstants
+#endif
+      );
+
+      return hipModuleLaunchKernel(
+          HipFunction, GridDim.x, GridDim.y, GridDim.z, BlockDim.x, BlockDim.y,
+          BlockDim.z, ShmemSize, (hipStream_t)Stream, KernelArgs, nullptr);
+    }
 #elif ENABLE_CUDA
     CUfunction CUFunc = CodeCache.lookup(HashValue);
     if (CUFunc) {
+      cuLaunchKernel(CUFunc, GridDim.x, GridDim.y, GridDim.z, BlockDim.x,
+                     BlockDim.y, BlockDim.z, ShmemSize, (CUstream)Stream,
+                     KernelArgs, nullptr);
+      return cudaGetLastError();
+    }
+
+    if ((CUFunc = StoredCache.lookup(HashValue, KernelName))) {
+      CodeCache.insert(HashValue, CUFunc
+#if ENABLE_DEBUG
+                       ,
+                       KernelName, RC, NumRuntimeConstants
+#endif
+      );
+
       cuLaunchKernel(CUFunc, GridDim.x, GridDim.y, GridDim.z, BlockDim.x,
                      BlockDim.y, BlockDim.z, ShmemSize, (CUstream)Stream,
                      KernelArgs, nullptr);
@@ -1117,34 +1334,10 @@ public:
 #endif
 
 #if ENABLE_HIP
+    hipDeviceProp_t devProp;
+    hipErrCheck(hipGetDeviceProperties(&devProp, 0));
     auto IRBuffer = extractDeviceBitcodeHip(KernelName, FatbinWrapper->Binary);
 #elif ENABLE_CUDA
-    // Initialize CUDA and retrieve the compute capability, needed for later
-    // operations.
-    CUdevice CUDev;
-    CUcontext CUCtx;
-
-    cuErrCheck(cuInit(0));
-
-    CUresult CURes = cuCtxGetDevice(&CUDev);
-    if (CURes == CUDA_ERROR_INVALID_CONTEXT or !CUDev)
-      // TODO: is selecting device 0 correct?
-      cuErrCheck(cuDeviceGet(&CUDev, 0));
-
-    cuErrCheck(cuCtxGetCurrent(&CUCtx));
-    if (!CUCtx)
-      cuErrCheck(cuCtxCreate(&CUCtx, 0, CUDev));
-
-    int CCMajor;
-    cuErrCheck(cuDeviceGetAttribute(
-        &CCMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CUDev));
-    int CCMinor;
-    cuErrCheck(cuDeviceGetAttribute(
-        &CCMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CUDev));
-    std::string CudaArch = "sm_" + std::to_string(CCMajor * 10 + CCMinor);
-
-    DBG(dbgs() << "CUDA Arch " << CudaArch << "\n");
-
     auto IRBuffer =
         extractDeviceBitcodeCuda(KernelName, FatbinWrapper->Binary, FatbinSize);
 #else
@@ -1167,27 +1360,53 @@ public:
 #if ENABLE_DEBUG
     {
       std::error_code EC;
-      raw_fd_ostream OutBC(Twine("transformed-jit-" + KernelName + ".bc").str(),
-                           EC);
+      raw_fd_ostream OutBC(
+          Twine("transformed-jit-" + KernelName + Suffix + ".bc").str(), EC);
       if (EC)
         FATAL_ERROR("Cannot open device transformed bitcode file");
-      // TODO: Remove or leave it only for debugging.
       OutBC << *M;
       OutBC.close();
     }
 #endif
 
+    void *BinOut;
+    size_t BinSize;
 #if ENABLE_HIP
-    return codegenAndLaunchHip(M, KernelName, Suffix, HashValue, RC,
-                               NumRuntimeConstants, GridDim, BlockDim,
-                               KernelArgs, ShmemSize, (hipStream_t)Stream);
+    auto Ret = codegenAndLaunchHip(M, devProp.gcnArchName, KernelName, Suffix,
+                                   HashValue, RC, NumRuntimeConstants, &BinOut,
+                                   BinSize, GridDim, BlockDim, KernelArgs,
+                                   ShmemSize, (hipStream_t)Stream);
+
 #elif ENABLE_CUDA
-    return codegenAndLaunchCuda(M, CudaArch, KernelName, Suffix, HashValue, RC,
-                                NumRuntimeConstants, GridDim, BlockDim,
-                                KernelArgs, ShmemSize, (CUstream)Stream);
+    SmallVector<char, 4096> PTXStr;
+    SmallVector<char, 4096> FinalIR;
+    auto Ret = codegenAndLaunchCuda(M, CudaArch, KernelName, Suffix, HashValue,
+                                    RC, NumRuntimeConstants, FinalIR, PTXStr,
+                                    &BinOut, BinSize, GridDim, BlockDim,
+                                    KernelArgs, ShmemSize, (CUstream)Stream);
+#if ENABLE_LLVMIR_STORED_CACHE
+    BinOut = FinalIR.data();
+    BinSize = FinalIR.size();
+#elif ENABLE_CUDA_PTX_STORED_CACHE
+    BinOut = PTXStr.data();
+    BinSize = PTXStr.size();
+#endif
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
 #endif
+    StringRef CodeRef(reinterpret_cast<char *>(BinOut), BinSize);
+
+    {
+      std::error_code EC;
+      raw_fd_ostream OutBin(
+          Twine("cache-jit-" + std::to_string(HashValue) + ".o").str(), EC);
+      if (EC)
+        FATAL_ERROR("Cannot open device object file");
+      OutBin << CodeRef;
+      OutBin.close();
+    }
+
+    return Ret;
   }
 
   void insertRegisterVar(const char *VarName, const void *Addr) {
@@ -1196,19 +1415,53 @@ public:
 
 private:
   JitEngineDevice() {
-#if ENABLE_CUDA
+#if ENABLE_HIP
+    LLVMInitializeAMDGPUTargetInfo();
+    LLVMInitializeAMDGPUTarget();
+    LLVMInitializeAMDGPUTargetMC();
+    LLVMInitializeAMDGPUAsmPrinter();
+#elif ENABLE_CUDA
     LLVMInitializeNVPTXTargetInfo();
     LLVMInitializeNVPTXTarget();
     LLVMInitializeNVPTXTargetMC();
     LLVMInitializeNVPTXAsmPrinter();
+
+    // Initialize CUDA and retrieve the compute capability, needed for later
+    // operations.
+    CUdevice CUDev;
+    CUcontext CUCtx;
+
+    cuErrCheck(cuInit(0));
+
+    CUresult CURes = cuCtxGetDevice(&CUDev);
+    if (CURes == CUDA_ERROR_INVALID_CONTEXT or !CUDev)
+      // TODO: is selecting device 0 correct?
+      cuErrCheck(cuDeviceGet(&CUDev, 0));
+
+    cuErrCheck(cuCtxGetCurrent(&CUCtx));
+    if (!CUCtx)
+      cuErrCheck(cuCtxCreate(&CUCtx, 0, CUDev));
+
+    int CCMajor;
+    cuErrCheck(cuDeviceGetAttribute(
+        &CCMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CUDev));
+    int CCMinor;
+    cuErrCheck(cuDeviceGetAttribute(
+        &CCMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CUDev));
+    CudaArch = "sm_" + std::to_string(CCMajor * 10 + CCMinor);
+
+    DBG(dbgs() << "CUDA Arch " << CudaArch << "\n");
 #endif
   }
 
   std::unordered_map<std::string, const void *> VarNameToDevPtr;
 #if ENABLE_HIP
   JitCache<hipFunction_t> CodeCache;
+  JitStoredCache<hipFunction_t> StoredCache;
 #elif ENABLE_CUDA
   JitCache<CUfunction> CodeCache;
+  JitStoredCache<CUfunction> StoredCache;
+  std::string CudaArch;
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
 #endif
@@ -1227,8 +1480,8 @@ __attribute((used)) void __jit_register_var(const void *HostAddr,
   Jit.insertRegisterVar(VarName, DevPtr);
 #elif ENABLE_CUDA
   // NOTE: For CUDA, it fails to get the symbol address inside the constructor
-  // context, so we save the host address and defer resolving the symbol address
-  // when patching the bitcode.
+  // context, so we save the host address and defer resolving the symbol
+  // address when patching the bitcode.
   Jit.insertRegisterVar(VarName, HostAddr);
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
@@ -1240,18 +1493,20 @@ __attribute__((used))
 // NOTE: Using the ABI With scalars for GridDim, BlockDim instead of dim3 to
 // avoid issues with aggregate coercion of parameters.
 hipError_t
-__jit_launch_kernel(char *KernelName, FatbinWrapper_t *FatbinWrapper,
-                    size_t FatbinSize, RuntimeConstant *RC,
-                    int NumRuntimeConstants, uint64_t GridDimXY,
-                    uint32_t GridDimZ, uint64_t BlockDim_XY, uint32_t BlockDimZ,
-                    void **KernelArgs, uint64_t ShmemSize, void *Stream) {
+__jit_launch_kernel(const char *ModuleUniqueId, char *KernelName,
+                    FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
+                    RuntimeConstant *RC, int NumRuntimeConstants,
+                    uint64_t GridDimXY, uint32_t GridDimZ, uint64_t BlockDim_XY,
+                    uint32_t BlockDimZ, void **KernelArgs, uint64_t ShmemSize,
+                    void *Stream) {
 
 #elif ENABLE_CUDA
 cudaError_t
-__jit_launch_kernel(char *KernelName, FatbinWrapper_t *FatbinWrapper,
-                    size_t FatbinSize, RuntimeConstant *RC,
-                    int NumRuntimeConstants, dim3 GridDim, dim3 BlockDim,
-                    void **KernelArgs, uint64_t ShmemSize, void *Stream) {
+__jit_launch_kernel(const char *ModuleUniqueId, char *KernelName,
+                    FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
+                    RuntimeConstant *RC, int NumRuntimeConstants, dim3 GridDim,
+                    dim3 BlockDim, void **KernelArgs, uint64_t ShmemSize,
+                    void *Stream) {
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined'
 #endif
@@ -1275,8 +1530,8 @@ __jit_launch_kernel(char *KernelName, FatbinWrapper_t *FatbinWrapper,
   DBG(dbgs() << "ShmemSize " << ShmemSize << "\n");
   DBG(dbgs() << "Stream " << Stream << "\n");
   DBG(dbgs() << "=== End Kernel Info\n");
-  return Jit.compileAndRun(KernelName, FatbinWrapper, FatbinSize, RC,
-                           NumRuntimeConstants, GridDim, BlockDim, KernelArgs,
-                           ShmemSize, Stream);
+  return Jit.compileAndRun(ModuleUniqueId, KernelName, FatbinWrapper,
+                           FatbinSize, RC, NumRuntimeConstants, GridDim,
+                           BlockDim, KernelArgs, ShmemSize, Stream);
 }
 }

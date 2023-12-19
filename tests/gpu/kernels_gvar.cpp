@@ -1,16 +1,19 @@
-// RUN: ./kernels_gvar.%ext | FileCheck %s
+// RUN: ./kernels_gvar.%ext | FileCheck %s --check-prefixes=CHECK,CHECK-FIRST
+// Second run uses the object cache.
+// RUN: ./kernels_gvar.%ext | FileCheck %s --check-prefixes=CHECK,CHECK-SECOND
 #include <climits>
 #include <cstdio>
-#include <cuda_runtime.h>
+
+#include "gpu_common.h"
 
 __device__ int gvar = 23;
 
-#define cudaErrCheck(CALL)                                                     \
+#define gpuErrCheck(CALL)                                                      \
   {                                                                            \
-    cudaError_t err = CALL;                                                    \
-    if (err != cudaSuccess) {                                                  \
+    gpuError_t err = CALL;                                                     \
+    if (err != gpuSuccess) {                                                   \
       printf("ERROR @ %s:%d ->  %s\n", __FILE__, __LINE__,                     \
-             cudaGetErrorString(err));                                         \
+             gpuGetErrorString(err));                                          \
       abort();                                                                 \
     }                                                                          \
   }
@@ -32,11 +35,11 @@ __global__ void kernel3() {
 
 int main() {
   kernel<<<1, 1>>>();
-  cudaErrCheck(cudaDeviceSynchronize());
+  gpuErrCheck(gpuDeviceSynchronize());
   kernel2<<<1, 1>>>();
-  cudaErrCheck(cudaDeviceSynchronize());
+  gpuErrCheck(gpuDeviceSynchronize());
   kernel3<<<1, 1>>>();
-  cudaErrCheck(cudaDeviceSynchronize());
+  gpuErrCheck(gpuDeviceSynchronize());
   return 0;
 }
 
@@ -44,5 +47,7 @@ int main() {
 // CHECK: Kernel2 gvar 25 addr [[ADDR]]
 // CHECK: Kernel3 gvar 26 addr [[ADDR]]
 // CHECK: JitCache hits 0 total 2
-// CHECK: HashValue {{[0-9]+}} num_execs 1
-// CHECK: HashValue {{[0-9]+}} num_execs 1
+// CHECK: HashValue {{[0-9]+}} NumExecs 1 NumHits 0
+// CHECK: HashValue {{[0-9]+}} NumExecs 1 NumHits 0
+// CHECK-FIRST: JitStoredCache hits 0 total 2
+// CHECK-SECOND: JitStoredCache hits 2 total 2
