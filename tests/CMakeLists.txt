@@ -107,7 +107,7 @@ function(CREATE_GPU_TEST_RDC exe source)
 
     if(ENABLE_HIP)
         # This is unsupported see: https://gitlab.kitware.com/cmake/cmake/-/issues/23210
-        # set_target_properties(${exe}.rdc PROPERTIES ${lang}_SEPARABLE_COMPILATION on)
+        # set_target_properties(${exe}.rdc PROPERTIES HIP_SEPARABLE_COMPILATION on)
 
         # Add -fgpu-rdc, --hip-link options for compilation and linking to enable RDC.
         target_compile_options(
@@ -124,8 +124,9 @@ function(CREATE_GPU_TEST_RDC exe source)
             PUBLIC
             -fpass-plugin=$<TARGET_FILE:JitPass>
         )
-        set_target_properties(${exe}.${lang}.rdc PROPERTIES # CUDA_RUNTIME_LIBRARY Shared
-            CUDA_SEPARABLE_COMPILATION ON)
+
+        # set_target_properties(${exe}.${lang} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+        set_target_properties(${exe}.${lang}.rdc PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     else()
         message(FATAL_ERROR "ENABLE_HIP or ENABLE_CUDA must be defined for GPU tests")
     endif()
