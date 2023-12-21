@@ -969,7 +969,7 @@ public:
 
       // Replace argument uses with runtime constants.
 #if ENABLE_RUNTIME_CONSTPROP
-      if (Config.ENV_RUNTIME_CONSTPROP)
+      if (Config.ENV_JIT_RUNTIME_CONSTPROP)
         for (int I = 0; I < Node->getNumOperands(); ++I) {
           ConstantAsMetadata *CAM =
               cast<ConstantAsMetadata>(Node->getOperand(I));
@@ -1225,8 +1225,7 @@ public:
 
     codegenPTX(*M, CudaArch, PTXStr);
 
-// #if ENABLE_DEBUG
-#if 1
+#if ENABLE_DEBUG
     {
       std::error_code EC;
       raw_fd_ostream OutPtx(
@@ -1241,7 +1240,7 @@ public:
     CUmodule CUMod;
     CUfunction CUFunc;
     // CUDA requires null-terminated PTX.
-    // PTXStr.push_back('\0');
+    PTXStr.push_back('\0');
 #if ENABLE_LLVMIR_STORED_CACHE
     {
       raw_svector_ostream IROS(FinalIR);
@@ -1301,7 +1300,7 @@ public:
           HipFunction, GridDim.x, GridDim.y, GridDim.z, BlockDim.x, BlockDim.y,
           BlockDim.z, ShmemSize, (hipStream_t)Stream, KernelArgs, nullptr);
 
-    if (Config.ENV_USE_STORED_CACHE)
+    if (Config.ENV_JIT_USE_STORED_CACHE)
       if ((HipFunction = StoredCache.lookup(HashValue, KernelName))) {
         CodeCache.insert(HashValue, HipFunction
 #if ENABLE_DEBUG
@@ -1324,19 +1323,20 @@ public:
       return cudaGetLastError();
     }
 
-    if ((CUFunc = StoredCache.lookup(HashValue, KernelName))) {
-      CodeCache.insert(HashValue, CUFunc
+    if (Config.ENV_JIT_USE_STORED_CACHE)
+      if ((CUFunc = StoredCache.lookup(HashValue, KernelName))) {
+        CodeCache.insert(HashValue, CUFunc
 #if ENABLE_DEBUG
-                       ,
-                       KernelName, RC, NumRuntimeConstants
+                         ,
+                         KernelName, RC, NumRuntimeConstants
 #endif
-      );
+        );
 
-      cuLaunchKernel(CUFunc, GridDim.x, GridDim.y, GridDim.z, BlockDim.x,
-                     BlockDim.y, BlockDim.z, ShmemSize, (CUstream)Stream,
-                     KernelArgs, nullptr);
-      return cudaGetLastError();
-    }
+        cuLaunchKernel(CUFunc, GridDim.x, GridDim.y, GridDim.z, BlockDim.x,
+                       BlockDim.y, BlockDim.z, ShmemSize, (CUstream)Stream,
+                       KernelArgs, nullptr);
+        return cudaGetLastError();
+      }
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
 #endif
@@ -1404,7 +1404,7 @@ public:
 #endif
     StringRef CodeRef(reinterpret_cast<char *>(BinOut), BinSize);
 
-    if (Config.ENV_USE_STORED_CACHE) {
+    if (Config.ENV_JIT_USE_STORED_CACHE) {
       std::error_code EC;
       raw_fd_ostream OutBin(
           Twine("cache-jit-" + std::to_string(HashValue) + ".o").str(), EC);
@@ -1461,12 +1461,20 @@ private:
     DBG(dbgs() << "CUDA Arch " << CudaArch << "\n");
 #endif
 
+    Config.ENV_JIT_USE_STORED_CACHE =
+        getEnvOrDefaultBool("ENV_JIT_USE_STORED_CACHE", true);
     Config.ENV_JIT_LAUNCH_BOUNDS =
         getEnvOrDefaultBool("ENV_JIT_LAUNCH_BOUNDS", true);
-    Config.ENV_USE_STORED_CACHE =
-        getEnvOrDefaultBool("ENV_USE_STORED_CACHE", true);
-    Config.ENV_RUNTIME_CONSTPROP =
-        getEnvOrDefaultBool("ENV_RUNTIME_CONSTPROP", true);
+    Config.ENV_JIT_RUNTIME_CONSTPROP =
+        getEnvOrDefaultBool("ENV_JIT_RUNTIME_CONSTPROP", true);
+
+#if ENABLE_DEBUG
+    dbgs() << "ENV_JIT_USE_STORED_CACHE " << Config.ENV_JIT_USE_STORED_CACHE
+           << "\n";
+    dbgs() << "ENV_JIT_LAUNCH_BOUNDS " << Config.ENV_JIT_LAUNCH_BOUNDS << "\n";
+    dbgs() << "ENV_JIT_RUNTIME_CONSTPROP " << Config.ENV_JIT_RUNTIME_CONSTPROP
+           << "\n";
+#endif
   }
 
   bool getEnvOrDefaultBool(const char *VarName, bool Default) {
@@ -1476,9 +1484,9 @@ private:
 
   std::unordered_map<std::string, const void *> VarNameToDevPtr;
   struct {
+    bool ENV_JIT_USE_STORED_CACHE;
     bool ENV_JIT_LAUNCH_BOUNDS;
-    bool ENV_USE_STORED_CACHE;
-    bool ENV_RUNTIME_CONSTPROP;
+    bool ENV_JIT_RUNTIME_CONSTPROP;
   } Config;
 #if ENABLE_HIP
   JitCache<hipFunction_t> CodeCache;
