@@ -1,9 +1,11 @@
-# NOTE: For CUDA the jit library is intentionally build as STATIC to avoid symbol
+# NOTE: For CUDA the jit library is must build as STATIC to avoid symbol
 # resolution problems with cudaGetSymbolAddress for device globals linking on
 # the targeted application
-# NOTE : When SHARED, the jit library and the application to deploy on should
-# link the CUDA runtime as a dynamic, shared library.
 if(BUILD_SHARED_LIBJIT)
+  if(ENABLE_CUDA)
+    message(FATAL_ERROR "For CUDA, using libjit as SHARED fails for device globals")
+  endif()
+
   add_library(jit SHARED jit.cpp)
 else()
   add_library(jit STATIC jit.cpp)
