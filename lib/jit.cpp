@@ -316,8 +316,8 @@ struct Codegen {
     }
 
 #if ENABLE_DEBUG
-    dbgs() << "=== Linked M\n" << *M << "=== End of Linked M\n";
-    if (verifyModule(*M, &errs()))
+    dbgs() << "=== Linked M\n" << M << "=== End of Linked M\n";
+    if (verifyModule(M, &errs()))
       FATAL_ERROR(
           "After linking, broken module found, JIT compilation aborted!");
     else
@@ -1024,6 +1024,22 @@ public:
                    << " => Set Wokgroup size " << BlockSize
                    << " WavesPerEU (unused) " << WavesPerEU << "\n");
 
+#elif ENABLE_CUDA
+        NamedMDNode *NvvmAnnotations = M->getNamedMetadata("nvvm.annotations");
+        assert(NvvmAnnotations &&
+               "Expected non-null nvvm.annotations metadata");
+        // TODO: fix hardcoded 1024 as the maximum, by reading device
+        // properties.
+        // TODO: set min GridSize.
+        int MaxThreads = std::min(1024, BlockSize);
+        llvm::Metadata *MDVals[] = {
+            llvm::ConstantAsMetadata::get(F),
+            llvm::MDString::get(M->getContext(), "maxntidx"),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(M->getContext()), MaxThreads))};
+        NvvmAnnotations->addOperand(llvm::MDNode::get(M->getContext(), MDVals));
+#else
+#error "Expected ENABLE_HIP or ENABLE_CUDA to be defined'
 #endif
       }
 #endif
