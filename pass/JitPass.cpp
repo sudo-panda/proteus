@@ -84,16 +84,18 @@ DenseMap<Value *, GlobalVariable *> StubToKernelMap;
 SmallPtrSet<Function *, 16> ModuleDeviceKernels;
 
 static Value *getStubGV(Value *Operand) {
+  // NOTE: when called by isDeviceKernelStub, Operand may not be a global
+  // variable point to the stub, so we check and return null in that case.
 #if ENABLE_HIP
   // NOTE: Hip creates a global named after the device kernel function that
   // points to the host kernel stub. Because of this, we need to unpeel this
   // indirection to use the host kernel stub for finding the device kernel
   // function name global.
   GlobalVariable *IndirectGV = dyn_cast<GlobalVariable>(Operand);
-  assert(IndirectGV && "Expected global variable pointing to hip kernel stub");
-  Value *V = IndirectGV->getInitializer();
+  Value *V = IndirectGV ? IndirectGV->getInitializer() : nullptr;
 #elif ENABLE_CUDA
-  Value *V = Operand;
+  GlobalVariable *DirectGV = dyn_cast<GlobalVariable>(Operand);
+  Value *V = DirectGV ? DirectGV : nullptr;
 #else
 #error "Expected ENABLE_HIP or ENABLE_CUDA to be defined"
 #endif
@@ -189,9 +191,13 @@ static bool isDeviceKernelStub(Module &M, Function &Fn) {
     if (CallBase *CB = dyn_cast<CallBase>(Usr))
       if (CB->getFunction() == &Fn) {
         dbgs() << "Found kernel stub " << Fn.getName() << "\n";
-        assert(StubToKernelMap.contains(getStubGV(CB->getArgOperand(0))) &&
-               "Expected kernel operand to be in the StubToKernel map");
-        return true;
+        // NOTE: all users may not be stubs, so check return value of
+        // getStubGV. If nullptr, then then this was not a stub.
+        auto GV = getStubGV(CB->getArgOperand(0));
+        if (!GV)
+          continue;
+        if(StubToKernelMap.contains(GV))
+          return true;
       }
 
   return false;
