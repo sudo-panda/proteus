@@ -38,6 +38,7 @@
 #include "llvm/Transforms/IPO/StripSymbols.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/Constant.h>
@@ -583,6 +584,12 @@ createJITModuleDevice(Module &M,
          "Expected llvm.global.annotations in jit module");
   JitGlobalsToRemove.insert(JitGlobalAnnotations);
 
+  // Clang emits this global variable in RDC compilation. We need to remove it
+  // to avoid dangling references to unused kernels that are removed.
+  auto *JitClangGPUUsedExternals= JitMod->getNamedGlobal("__clang_gpu_used_external");
+  if(JitClangGPUUsedExternals)
+    JitGlobalsToRemove.insert(JitClangGPUUsedExternals);
+
   for (auto &GV : JitMod->globals()) {
     if (GV.getName().starts_with("__jit_bc"))
       JitGlobalsToRemove.insert(&GV);
@@ -598,7 +605,20 @@ createJITModuleDevice(Module &M,
   });
 
   for (auto *GV : JitGlobalsToRemove)
-    JitMod->eraseGlobalVariable(GV);
+    GV->eraseFromParent();
+
+  ModuleDeviceKernels = getDeviceKernels(*JitMod);
+  SmallPtrSet<Function *, 8> JitUnusedKernelsToRemove;
+  for(auto &JitModF : *JitMod) {
+    // Remove unused kernels that have been demoted to declarations during
+    // cloning.
+    if(JitModF.isDeclaration())
+      if(isDeviceKernel(&JitModF))
+        JitUnusedKernelsToRemove.insert(&JitModF);
+  }
+
+  for(auto *F : JitUnusedKernelsToRemove)
+    F->eraseFromParent();
 
   Function *JitF = cast<Function>(VMap[JITFn]);
   // Run a global DCE pass on the JIT module IR to remove
@@ -629,6 +649,8 @@ createJITModuleDevice(Module &M,
 
 #if ENABLE_DEBUG
   {
+    // NOTE: We must have a single kernel per JIT module, otherwise CUDA/HIP RTC
+    // interfaces fail with linking errors.
     auto JITKernels = getDeviceKernels(*JitMod);
     if (JITKernels.size() != 1)
       report_fatal_error("Expected a single kernel in JIT module");
@@ -711,7 +733,8 @@ static void emitJITKernelEntry(Module &M,
   Type *VoidPtrTy = Type::getInt8PtrTy(M.getContext());
   Type *Int64Ty = Type::getInt64Ty(M.getContext());
   Type *Int32Ty = Type::getInt32Ty(M.getContext());
-  StructType *RuntimeConstantTy = StructType::create({Int64Ty}, "struct.args");
+  Type *Int128Ty = Type::getInt128Ty(M.getContext());
+  StructType *RuntimeConstantTy = StructType::create({Int128Ty}, "struct.args");
 
   GlobalVariable *ModuleUniqueId =
       M.getGlobalVariable("__module_unique_id", true);
@@ -934,8 +957,9 @@ emitJITFunctionStub(Module &M,
   Type *VoidPtrTy = Type::getInt8PtrTy(M.getContext());
   Type *Int32Ty = Type::getInt32Ty(M.getContext());
   Type *Int64Ty = Type::getInt64Ty(M.getContext());
+  Type *Int128Ty = Type::getInt128Ty(M.getContext());
   // Use Int64 type for the Value, big enough to hold primitives.
-  StructType *RuntimeConstantTy = StructType::create({Int64Ty}, "struct.args");
+  StructType *RuntimeConstantTy = StructType::create({Int128Ty}, "struct.args");
 
   FunctionType *JitEntryFnTy =
       FunctionType::get(VoidPtrTy,
