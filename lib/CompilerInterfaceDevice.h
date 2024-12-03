@@ -11,49 +11,33 @@
 #ifndef PROTEUS_COMPILERINTERFACEDEVICE_H
 #define PROTEUS_COMPILERINTERFACEDEVICE_H
 
-#include "JitEngineDevice.hpp"
+#include "CompilerInterfaceTypes.h"
+
 #if ENABLE_CUDA
 #include "JitEngineDeviceCUDA.hpp"
 using JitDeviceImplT = proteus::JitEngineDeviceCUDA;
+
+extern "C" cudaError_t __jit_launch_kernel(const char *ModuleUniqueId,
+                                           void *Kernel, void *FatbinWrapper,
+                                           size_t FatbinSize, dim3 GridDim,
+                                           dim3 BlockDim, void **KernelArgs,
+                                           uint64_t ShmemSize, void *Stream);
+
 #elif ENABLE_HIP
 #include "JitEngineDeviceHIP.hpp"
 using JitDeviceImplT = proteus::JitEngineDeviceHIP;
+
+// This extern global variable is used to resolve the global symbol through ORC
+// in JitEngineHost, if existing (extern weak linkage).
+__attribute__((weak)) extern "C" char __hip_fatbin;
+extern "C" hipError_t
+__jit_launch_kernel(const char *ModuleUniqueId, void *Kernel,
+                    void *FatbinWrapper, size_t FatbinSize, uint64_t GridDimXY,
+                    uint32_t GridDimZ, uint64_t BlockDim_XY, uint32_t BlockDimZ,
+                    void **KernelArgs, uint64_t ShmemSize, void *Stream);
+
 #else
 #error "CompilerInterfaceDevice requires ENABLE_CUDA or ENABLE_HIP"
 #endif
-
-// Return "auto" should resolve to cudaError_t or hipError_t.
-static inline auto __jit_launch_kernel_internal(
-    const char *ModuleUniqueId, char *KernelName,
-    proteus::FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
-    RuntimeConstant *RC, int NumRuntimeConstants, dim3 GridDim, dim3 BlockDim,
-    void **KernelArgs, uint64_t ShmemSize, void *Stream) {
-
-  using namespace llvm;
-  using namespace proteus;
-
-  auto printKernelLaunchInfo = [&]() {
-    dbgs() << "JIT Launch Kernel\n";
-    dbgs() << "=== Kernel Info\n";
-    dbgs() << "KernelName " << KernelName << "\n";
-    dbgs() << "FatbinSize " << FatbinSize << "\n";
-    dbgs() << "Grid " << GridDim.x << ", " << GridDim.y << ", " << GridDim.z
-           << "\n";
-    dbgs() << "Block " << BlockDim.x << ", " << BlockDim.y << ", " << BlockDim.z
-           << "\n";
-    dbgs() << "KernelArgs " << KernelArgs << "\n";
-    dbgs() << "ShmemSize " << ShmemSize << "\n";
-    dbgs() << "Stream " << Stream << "\n";
-    dbgs() << "=== End Kernel Info\n";
-  };
-
-  TIMESCOPE("__jit_launch_kernel");
-  DBG(printKernelLaunchInfo());
-  auto &Jit = JitDeviceImplT::instance();
-  return Jit.compileAndRun(
-      ModuleUniqueId, KernelName, FatbinWrapper, FatbinSize, RC,
-      NumRuntimeConstants, GridDim, BlockDim, KernelArgs, ShmemSize,
-      static_cast<typename JitDeviceImplT::DeviceStream_t>(Stream));
-}
 
 #endif

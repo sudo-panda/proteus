@@ -11,10 +11,12 @@
 #ifndef PROTEUS_COMPILERINTERFACETYPES_H
 #define PROTEUS_COMPILERINTERFACETYPES_H
 
+#include <cstring>
 #include <stdint.h>
 
 struct RuntimeConstant {
-  union {
+  RuntimeConstant() { std::memset(&Value, 0, sizeof(RuntimeConstantType)); }
+  using RuntimeConstantType = union {
     bool BoolVal;
     int8_t Int8Val;
     int32_t Int32Val;
@@ -25,6 +27,7 @@ struct RuntimeConstant {
     // TODO: This allows pointer as runtime constant values. How useful is that?
     void *PtrVal;
   };
+  RuntimeConstantType Value;
 };
 
 #endif

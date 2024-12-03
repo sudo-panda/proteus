@@ -12,6 +12,9 @@
 #define PROTEUS_JITENGINEDEVICE_HPP
 
 #include <cstdint>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBufferRef.h>
 #include <memory>
 
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -28,6 +31,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include <llvm/IR/Constants.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
+#include <optional>
 
 #include "CompilerInterfaceTypes.h"
 #include "JitCache.hpp"
@@ -36,12 +40,27 @@
 #include "TransformArgumentSpecialization.hpp"
 #include "Utils.h"
 
-// TODO: check if this global is needed.
-static llvm::codegen::RegisterCodeGenFlags CFG;
-
 namespace proteus {
 
 using namespace llvm;
+
+class JITKernelInfo {
+  char const *Name;
+  SmallVector<int32_t> RCIndices;
+  int32_t NumRCs;
+
+public:
+  JITKernelInfo(char const *_Name, int32_t *_RCIndices, int32_t _NumRCs)
+      : Name(_Name), NumRCs(_NumRCs) {
+    for (int32_t I = 0; I < NumRCs; ++I) {
+      RCIndices.push_back(_RCIndices[I]);
+    }
+  }
+  JITKernelInfo() : Name(nullptr), NumRCs(0), RCIndices() {}
+  auto getName() const { return Name; }
+  auto getRCIndices() const { return RCIndices; }
+  auto getNumRCs() const { return NumRCs; }
+};
 
 struct FatbinWrapper_t {
   int32_t Magic;
@@ -58,14 +77,32 @@ public:
   using DeviceStream_t = typename DeviceTraits<ImplT>::DeviceStream_t;
   using KernelFunction_t = typename DeviceTraits<ImplT>::KernelFunction_t;
 
-  DeviceError_t compileAndRun(StringRef ModuleUniqueId, StringRef KernelName,
-                              FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
-                              RuntimeConstant *RC, int NumRuntimeConstants,
-                              dim3 GridDim, dim3 BlockDim, void **KernelArgs,
-                              uint64_t ShmemSize, DeviceStream_t Stream);
+  DeviceError_t
+  compileAndRun(StringRef ModuleUniqueId, StringRef KernelName,
+                FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
+                const SmallVector<int32_t> &RCIndices,
+                int32_t NumRuntimeConstants, dim3 GridDim, dim3 BlockDim,
+                void **KernelArgs, uint64_t ShmemSize,
+                typename DeviceTraits<ImplT>::DeviceStream_t Stream);
 
   void insertRegisterVar(const char *VarName, const void *Addr) {
     VarNameToDevPtr[VarName] = Addr;
+  }
+
+  void insertRegisterFunction(const void *HostAddr, char *FunctionName,
+                              int32_t *RCIndices, int32_t NumRCs) {
+    JITKernelInfoMap[HostAddr] = JITKernelInfo(FunctionName, RCIndices, NumRCs);
+  }
+
+  bool containsJITKernelInfo(const void *Func) {
+    return JITKernelInfoMap.contains(Func);
+  }
+
+  std::optional<JITKernelInfo> getJITKernelInfo(const void *Func) {
+    if (!containsJITKernelInfo(Func)) {
+      return std::nullopt;
+    }
+    return JITKernelInfoMap[Func];
   }
 
 private:
@@ -76,10 +113,59 @@ private:
     return static_cast<ImplT &>(*this).resolveDeviceGlobalAddr(Addr);
   }
 
-  void setLaunchBoundsForKernel(Module *M, Function *F, int GridSize,
+  void setLaunchBoundsForKernel(Module &M, Function &F, int GridSize,
                                 int BlockSize) {
     static_cast<ImplT &>(*this).setLaunchBoundsForKernel(M, F, GridSize,
                                                          BlockSize);
+  }
+
+  void getRuntimeConstantsFromModule(Module &M, void **KernelArgs,
+                                     StringRef KernelName,
+                                     const SmallVector<int32_t> &RCIndices,
+                                     SmallVector<RuntimeConstant> &RCsVec) {
+    Function *F = M.getFunction(KernelName);
+    MDNode *Node = F->getMetadata("jit_arg_nos");
+
+    for (int I = 0; I < Node->getNumOperands(); ++I) {
+      ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
+      ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
+      int ArgNo = ConstInt->getZExtValue();
+      Value *Arg = F->getArg(ArgNo);
+      Type *ArgType = Arg->getType();
+      Constant *C = nullptr;
+
+      RuntimeConstant RC;
+      if (ArgType->isIntegerTy(1)) {
+        RC.Value.BoolVal = *(bool *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isIntegerTy(8)) {
+        RC.Value.Int8Val = *(int8_t *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isIntegerTy(32)) {
+        RC.Value.Int32Val = *(int32_t *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isIntegerTy(64)) {
+        RC.Value.Int64Val = *(int64_t *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isFloatTy()) {
+        RC.Value.FloatVal = *(float *)KernelArgs[RCIndices[I]];
+      }
+      // NOTE: long double on device should correspond to plain double.
+      // XXX: CUDA with a long double SILENTLY fails to create a working
+      // kernel in AOT compilation, with or without JIT.
+      else if (ArgType->isDoubleTy()) {
+        RC.Value.DoubleVal = *(double *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isX86_FP80Ty() || ArgType->isPPC_FP128Ty() ||
+                 ArgType->isFP128Ty()) {
+        RC.Value.LongDoubleVal = *(long double *)KernelArgs[RCIndices[I]];
+      } else if (ArgType->isPointerTy()) {
+        RC.Value.PtrVal = (void *)KernelArgs[RCIndices[I]];
+      } else {
+        std::string TypeString;
+        raw_string_ostream TypeOstream(TypeString);
+        ArgType->print(TypeOstream);
+        FATAL_ERROR("JIT Incompatible type in runtime constant: " +
+                    TypeOstream.str());
+      }
+
+      RCsVec.push_back(RC);
+    }
   }
 
   DeviceError_t launchKernelFunction(KernelFunction_t KernelFunc, dim3 GridDim,
@@ -87,6 +173,13 @@ private:
                                      uint64_t ShmemSize,
                                      DeviceStream_t Stream) {
     return static_cast<ImplT &>(*this).launchKernelFunction(
+        KernelFunc, GridDim, BlockDim, KernelArgs, ShmemSize, Stream);
+  }
+
+  DeviceError_t launchKernelDirect(void *KernelFunc, dim3 GridDim,
+                                   dim3 BlockDim, void **KernelArgs,
+                                   uint64_t ShmemSize, DeviceStream_t Stream) {
+    return static_cast<ImplT &>(*this).launchKernelDirect(
         KernelFunc, GridDim, BlockDim, KernelArgs, ShmemSize, Stream);
   }
 
@@ -110,9 +203,9 @@ private:
   // End Methods implemented in the derived device engine class.
   //------------------------------------------------------------------
 
-  Expected<orc::ThreadSafeModule>
-  specializeIR(StringRef FnName, StringRef Suffix, StringRef IR, int BlockSize,
-               int GridSize, RuntimeConstant *RC, int NumRuntimeConstants);
+  void specializeIR(Module &M, StringRef FnName, StringRef Suffix,
+                    int BlockSize, int GridSize, RuntimeConstant *RC,
+                    int NumRuntimeConstants);
 
   void
   relinkGlobals(Module &M,
@@ -129,52 +222,49 @@ protected:
   JitStorageCache<KernelFunction_t> StorageCache;
   std::string DeviceArch;
   std::unordered_map<std::string, const void *> VarNameToDevPtr;
+
+private:
+  // This map is private and only accessible via the API.
+  DenseMap<const void *, JITKernelInfo> JITKernelInfoMap;
 };
 
 template <typename ImplT>
-Expected<orc::ThreadSafeModule> JitEngineDevice<ImplT>::specializeIR(
-    StringRef FnName, StringRef Suffix, StringRef IR, int BlockSize,
-    int GridSize, RuntimeConstant *RC, int NumRuntimeConstants) {
+void JitEngineDevice<ImplT>::specializeIR(Module &M, StringRef FnName,
+                                          StringRef Suffix, int BlockSize,
+                                          int GridSize, RuntimeConstant *RC,
+                                          int NumRuntimeConstants) {
 
   TIMESCOPE("specializeIR");
-  auto Ctx = std::make_unique<LLVMContext>();
-  SMDiagnostic Err;
-  if (auto M = parseIR(MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()),
-                       Err, *Ctx)) {
-    DBG(dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n");
-    Function *F = M->getFunction(FnName);
-    assert(F && "Expected non-null function!");
-    MDNode *Node = F->getMetadata("jit_arg_nos");
-    assert(Node && "Expected metadata for jit arguments");
-    DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node
-               << "\n");
+  DBG(dbgs() << "=== Parsed Module\n" << M << "=== End of Parsed Module\n");
+  Function *F = M.getFunction(FnName);
+  assert(F && "Expected non-null function!");
+  MDNode *Node = F->getMetadata("jit_arg_nos");
+  assert(Node && "Expected metadata for jit arguments");
+  DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node
+             << "\n");
 
-    // Replace argument uses with runtime constants.
-    if (Config.ENV_PROTEUS_SPECIALIZE_ARGS)
-      // TODO: change NumRuntimeConstants to size_t at interface.
-      TransformArgumentSpecialization::transform(
-          *M, *F,
-          ArrayRef<RuntimeConstant>{RC,
-                                    static_cast<size_t>(NumRuntimeConstants)});
+  // Replace argument uses with runtime constants.
+  if (Config.ENV_PROTEUS_SPECIALIZE_ARGS)
+    // TODO: change NumRuntimeConstants to size_t at interface.
+    TransformArgumentSpecialization::transform(
+        M, *F,
+        ArrayRef<RuntimeConstant>{RC,
+                                  static_cast<size_t>(NumRuntimeConstants)});
 
-    DBG(dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n");
+  DBG(dbgs() << "=== JIT Module\n" << M << "=== End of JIT Module\n");
 
-    F->setName(FnName + Suffix);
+  F->setName(FnName + Suffix);
 
-    if (Config.ENV_PROTEUS_SET_LAUNCH_BOUNDS)
-      setLaunchBoundsForKernel(M.get(), F, GridSize, BlockSize);
+  if (Config.ENV_PROTEUS_SET_LAUNCH_BOUNDS)
+    setLaunchBoundsForKernel(M, *F, GridSize, BlockSize);
 
 #if ENABLE_DEBUG
-    dbgs() << "=== Final Module\n" << *M << "=== End Final Module\n";
-    if (verifyModule(*M, &errs()))
-      FATAL_ERROR("Broken module found, JIT compilation aborted!");
-    else
-      dbgs() << "Module verified!\n";
+  dbgs() << "=== Final Module\n" << M << "=== End Final Module\n";
+  if (verifyModule(M, &errs()))
+    FATAL_ERROR("Broken module found, JIT compilation aborted!");
+  else
+    dbgs() << "Module verified!\n";
 #endif
-    return orc::ThreadSafeModule(std::move(M), std::move(Ctx));
-  }
-
-  return createSMDiagnosticError(Err);
 }
 
 template <typename ImplT>
@@ -219,13 +309,36 @@ template <typename ImplT>
 typename DeviceTraits<ImplT>::DeviceError_t
 JitEngineDevice<ImplT>::compileAndRun(
     StringRef ModuleUniqueId, StringRef KernelName,
-    FatbinWrapper_t *FatbinWrapper, size_t FatbinSize, RuntimeConstant *RC,
-    int NumRuntimeConstants, dim3 GridDim, dim3 BlockDim, void **KernelArgs,
-    uint64_t ShmemSize, typename DeviceTraits<ImplT>::DeviceStream_t Stream) {
+    FatbinWrapper_t *FatbinWrapper, size_t FatbinSize,
+    const SmallVector<int32_t> &RCIndices, int32_t NumRuntimeConstants,
+    dim3 GridDim, dim3 BlockDim, void **KernelArgs, uint64_t ShmemSize,
+    typename DeviceTraits<ImplT>::DeviceStream_t Stream) {
   TIMESCOPE("compileAndRun");
 
-  uint64_t HashValue =
-      CodeCache.hash(ModuleUniqueId, KernelName, RC, NumRuntimeConstants);
+  SmallVector<RuntimeConstant> RCsVec;
+
+  auto IRBuffer =
+      extractDeviceBitcode(KernelName, FatbinWrapper->Binary, FatbinSize);
+
+  auto parseBitcode = [&]() -> Expected<orc::ThreadSafeModule> {
+    auto Ctx = std::make_unique<LLVMContext>();
+    SMDiagnostic Err;
+    if (auto M = parseIR(IRBuffer->getMemBufferRef(), Err, *Ctx))
+      return orc::ThreadSafeModule(std::move(M), std::move(Ctx));
+
+    return createSMDiagnosticError(Err);
+  };
+
+  auto SafeModule = parseBitcode();
+  if (auto E = SafeModule.takeError())
+    FATAL_ERROR(toString(std::move(E)).c_str());
+
+  auto *JitModule = SafeModule->getModuleUnlocked();
+  getRuntimeConstantsFromModule(*JitModule, KernelArgs, KernelName, RCIndices,
+                                RCsVec);
+
+  uint64_t HashValue = CodeCache.hash(ModuleUniqueId, KernelName, RCsVec.data(),
+                                      NumRuntimeConstants);
   typename DeviceTraits<ImplT>::KernelFunction_t KernelFunc =
       CodeCache.lookup(HashValue);
   if (KernelFunc)
@@ -267,7 +380,7 @@ JitEngineDevice<ImplT>::compileAndRun(
       auto KernelFunc =
           getKernelFunctionFromImage(KernelMangled, ObjBuf->getBufferStart());
 
-      CodeCache.insert(HashValue, KernelFunc, KernelName, RC,
+      CodeCache.insert(HashValue, KernelFunc, KernelName, RCsVec.data(),
                        NumRuntimeConstants);
 
       return launchKernelFunction(KernelFunc, GridDim, BlockDim, KernelArgs,
@@ -275,37 +388,30 @@ JitEngineDevice<ImplT>::compileAndRun(
     }
   }
 
-  auto IRBuffer =
-      extractDeviceBitcode(KernelName, FatbinWrapper->Binary, FatbinSize);
-
-  auto SpecializedModule =
-      specializeIR(KernelName, Suffix, IRBuffer->getBuffer(),
-                   BlockDim.x * BlockDim.y * BlockDim.z,
-                   GridDim.x * GridDim.y * GridDim.z, RC, NumRuntimeConstants);
-  if (auto E = SpecializedModule.takeError())
-    FATAL_ERROR(toString(std::move(E)).c_str());
-
-  Module *M = SpecializedModule->getModuleUnlocked();
+  specializeIR(
+      *JitModule, KernelName, Suffix, BlockDim.x * BlockDim.y * BlockDim.z,
+      GridDim.x * GridDim.y * GridDim.z, RCsVec.data(), NumRuntimeConstants);
 
   // For CUDA, run the target-specific optimization pipeline to optimize the
   // LLVM IR before handing over to the CUDA driver PTX compiler.
-  optimizeIR(*M, DeviceArch);
+  optimizeIR(*JitModule, DeviceArch);
 
   SmallString<4096> ModuleBuffer;
   raw_svector_ostream ModuleBufferOS(ModuleBuffer);
-  WriteBitcodeToFile(*M, ModuleBufferOS);
+  WriteBitcodeToFile(*JitModule, ModuleBufferOS);
   StorageCache.storeBitcode(HashValue, ModuleBuffer);
 
-  relinkGlobals(*M, VarNameToDevPtr);
+  relinkGlobals(*JitModule, VarNameToDevPtr);
 
-  auto ObjBuf = codegenObject(*M, DeviceArch);
+  auto ObjBuf = codegenObject(*JitModule, DeviceArch);
   if (Config.ENV_PROTEUS_USE_STORED_CACHE)
     StorageCache.storeObject(HashValue, ObjBuf->getMemBufferRef());
 
   KernelFunc =
       getKernelFunctionFromImage(KernelMangled, ObjBuf->getBufferStart());
 
-  CodeCache.insert(HashValue, KernelFunc, KernelName, RC, NumRuntimeConstants);
+  CodeCache.insert(HashValue, KernelFunc, KernelName, RCsVec.data(),
+                   NumRuntimeConstants);
 
   return launchKernelFunction(KernelFunc, GridDim, BlockDim, KernelArgs,
                               ShmemSize, Stream);

@@ -31,7 +31,7 @@ public:
 
   void *resolveDeviceGlobalAddr(const void *Addr);
 
-  void setLaunchBoundsForKernel(Module *M, Function *F, int GridSize,
+  void setLaunchBoundsForKernel(Module &M, Function &F, int GridSize,
                                 int BlockSize);
 
   std::unique_ptr<MemoryBuffer> extractDeviceBitcode(StringRef KernelName,
@@ -56,6 +56,10 @@ public:
   cudaError_t launchKernelFunction(CUfunction KernelFunc, dim3 GridDim,
                                    dim3 BlockDim, void **KernelArgs,
                                    uint64_t ShmemSize, CUstream Stream);
+
+  cudaError_t launchKernelDirect(void *KernelFunc, dim3 GridDim, dim3 BlockDim,
+                                 void **KernelArgs, uint64_t ShmemSize,
+                                 CUstream Stream);
 
 private:
   JitEngineDeviceCUDA();
