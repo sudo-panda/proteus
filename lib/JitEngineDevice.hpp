@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBufferRef.h>
@@ -130,17 +131,83 @@ private:
     return static_cast<ImplT &>(*this).resolveDeviceGlobalAddr(Addr);
   }
 
-  void setLaunchBoundsForKernel(Module &M, Function &F, int GridSize,
+  void setLaunchBoundsForKernel(Module &M, Function &F, size_t GridSize,
                                 int BlockSize) {
     static_cast<ImplT &>(*this).setLaunchBoundsForKernel(M, F, GridSize,
                                                          BlockSize);
   }
 
-  void getRuntimeConstantsFromModule(Module &M, StringRef FnName,
-                                     void **KernelArgs,
+  void setKernelDims(Module &M, dim3 &GridDim, dim3 &BlockDim) {
+    auto ReplaceIntrinsicDim = [&](StringRef IntrinsicName, uint32_t DimValue) {
+      auto CollectCallUsers = [](Function &F) {
+        SmallVector<CallInst *> CallUsers;
+        for (auto *User : F.users()) {
+          auto *Call = dyn_cast<CallInst>(User);
+          if (!Call)
+            continue;
+          CallUsers.push_back(Call);
+        }
+
+        return CallUsers;
+      };
+      Function *IntrinsicFunction = M.getFunction(IntrinsicName);
+      if (!IntrinsicFunction)
+        return;
+
+      for (auto *Call : CollectCallUsers(*IntrinsicFunction)) {
+        Value *ConstantValue =
+            ConstantInt::get(Type::getInt32Ty(M.getContext()), DimValue);
+        Call->replaceAllUsesWith(ConstantValue);
+        Call->eraseFromParent();
+      }
+    };
+
+    ReplaceIntrinsicDim(ImplT::gridDimXFnName(), GridDim.x);
+    ReplaceIntrinsicDim(ImplT::gridDimYFnName(), GridDim.y);
+    ReplaceIntrinsicDim(ImplT::gridDimZFnName(), GridDim.z);
+
+    ReplaceIntrinsicDim(ImplT::blockDimXFnName(), BlockDim.x);
+    ReplaceIntrinsicDim(ImplT::blockDimYFnName(), BlockDim.y);
+    ReplaceIntrinsicDim(ImplT::blockDimZFnName(), BlockDim.z);
+
+    auto InsertAssume = [&](StringRef IntrinsicName, int DimValue) {
+      Function *IntrinsicFunction = M.getFunction(IntrinsicName);
+      if (!IntrinsicFunction || IntrinsicFunction->use_empty())
+        return;
+
+      // Iterate over all uses of the intrinsic.
+      for (auto U : IntrinsicFunction->users()) {
+        auto *Call = dyn_cast<CallInst>(U);
+        if (!Call)
+          continue;
+
+        // Insert the llvm.assume intrinsic.
+        IRBuilder<> Builder(Call->getNextNode());
+        Value *Bound = ConstantInt::get(Call->getType(), DimValue);
+        Value *Cmp = Builder.CreateICmpULT(Call, Bound);
+
+        Function *AssumeIntrinsic =
+            Intrinsic::getDeclaration(&M, Intrinsic::assume);
+        Builder.CreateCall(AssumeIntrinsic, Cmp);
+      }
+    };
+
+    // Inform LLVM about the range of possible values of threadIdx.*.
+    InsertAssume(ImplT::threadIdxXFnName(), BlockDim.x);
+    InsertAssume(ImplT::threadIdxYFnName(), BlockDim.y);
+    InsertAssume(ImplT::threadIdxZFnName(), BlockDim.z);
+
+    // Inform LLVM about the range of possible values of blockIdx.*.
+    InsertAssume(ImplT::blockIdxXFnName(), GridDim.x);
+    InsertAssume(ImplT::blockIdxYFnName(), GridDim.y);
+    InsertAssume(ImplT::blockIdxZFnName(), GridDim.z);
+  }
+
+  void getRuntimeConstantsFromModule(Module &M, void **KernelArgs,
+                                     StringRef KernelName,
                                      const SmallVector<int32_t> &RCIndices,
                                      SmallVector<RuntimeConstant> &RCsVec) {
-    Function *F = M.getFunction(FnName);
+    Function *F = M.getFunction(KernelName);
     for (int I = 0; I < RCIndices.size(); ++I) {
       Value *Arg = F->getArg(RCIndices[I]);
       Type *ArgType = Arg->getType();
@@ -216,7 +283,7 @@ private:
   //------------------------------------------------------------------
 
   void specializeIR(Module &M, StringRef FnName, StringRef Suffix,
-                    int BlockSize, int GridSize,
+                    dim3 &BlockDim, dim3 &GridDim,
                     const SmallVector<int32_t> &RCIndices, RuntimeConstant *RC,
                     int NumRuntimeConstants);
 
@@ -245,8 +312,8 @@ private:
 
 template <typename ImplT>
 void JitEngineDevice<ImplT>::specializeIR(Module &M, StringRef FnName,
-                                          StringRef Suffix, int BlockSize,
-                                          int GridSize,
+                                          StringRef Suffix, dim3 &BlockDim,
+                                          dim3 &GridDim,
                                           const SmallVector<int32_t> &RCIndices,
                                           RuntimeConstant *RC,
                                           int NumRuntimeConstants) {
@@ -279,12 +346,18 @@ void JitEngineDevice<ImplT>::specializeIR(Module &M, StringRef FnName,
         ArrayRef<RuntimeConstant>{RC,
                                   static_cast<size_t>(NumRuntimeConstants)});
 
+  // Replace uses of blockDim.* and gridDim.* with constants.
+  if (Config.ENV_PROTEUS_SPECIALIZE_DIMS) {
+    setKernelDims(M, GridDim, BlockDim);
+  }
+
   DBG(dbgs() << "=== JIT Module\n" << M << "=== End of JIT Module\n");
 
   F->setName(FnName + Suffix);
 
   if (Config.ENV_PROTEUS_SET_LAUNCH_BOUNDS)
-    setLaunchBoundsForKernel(M, *F, GridSize, BlockSize);
+    setLaunchBoundsForKernel(M, *F, GridDim.x * GridDim.y * GridDim.z,
+                             BlockDim.x * BlockDim.y * BlockDim.z);
 
 #if ENABLE_DEBUG
   dbgs() << "=== Final Module\n" << M << "=== End Final Module\n";
@@ -360,7 +433,7 @@ JitEngineDevice<ImplT>::compileAndRun(
     FATAL_ERROR(toString(std::move(E)).c_str());
 
   auto *JitModule = SafeModule->getModuleUnlocked();
-  getRuntimeConstantsFromModule(*JitModule, KernelName, KernelArgs, RCIndices,
+  getRuntimeConstantsFromModule(*JitModule, KernelArgs, KernelName, RCIndices,
                                 RCsVec);
 
   uint64_t HashValue = CodeCache.hash(ModuleUniqueId, KernelName, RCsVec.data(),
@@ -414,10 +487,8 @@ JitEngineDevice<ImplT>::compileAndRun(
     }
   }
 
-  specializeIR(*JitModule, KernelName, Suffix,
-               BlockDim.x * BlockDim.y * BlockDim.z,
-               GridDim.x * GridDim.y * GridDim.z, RCIndices, RCsVec.data(),
-               NumRuntimeConstants);
+  specializeIR(*JitModule, KernelName, Suffix, BlockDim, GridDim, RCIndices,
+               RCsVec.data(), NumRuntimeConstants);
 
   // For CUDA, run the target-specific optimization pipeline to optimize the
   // LLVM IR before handing over to the CUDA driver PTX compiler.
