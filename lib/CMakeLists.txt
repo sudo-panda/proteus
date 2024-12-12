@@ -91,8 +91,11 @@ if(ENABLE_CUDA)
     ${CUDAToolkit_LIBRARY_DIR}/libnvptxcompiler_static.a)
 endif()
 
+find_package(Torch REQUIRED)
+
 target_compile_options(proteus PUBLIC -frtti)
 target_link_libraries(proteus PRIVATE ${libs} "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
+target_link_libraries(proteus PRIVATE ${TORCH_LIBRARIES})
 set_target_properties(proteus PROPERTIES
   INSTALL_RPATH_USE_LINK_PATH TRUE)
 

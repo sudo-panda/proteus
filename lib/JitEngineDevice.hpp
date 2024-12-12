@@ -36,6 +36,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <optional>
+#include <torch/script.h>
 
 #include "CompilerInterfaceTypes.h"
 #include "JitCache.hpp"
@@ -483,6 +484,14 @@ JitEngineDevice<ImplT>::compileAndRun(
       return launchKernelFunction(KernelFunc, GridDim, BlockDim, KernelArgs,
                                   ShmemSize, Stream);
     }
+  }
+
+  torch::jit::script::Module module;
+  try {
+    module = torch::jit::load("/usr/WS2/kundu1/RT_Tuner/torchscript/my_module_model.pt");
+  }
+  catch (const c10::Error& e) {
+    std::cerr << "error loading the model\n";
   }
 
   specializeIR(*JitModule, KernelName, Suffix, BlockDim, GridDim, RCIndices,
