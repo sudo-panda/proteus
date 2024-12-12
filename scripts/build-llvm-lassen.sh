@@ -33,6 +33,7 @@ cmake -G Ninja \
     -DLLVM_LINK_LLVM_DYLIB=on \
     -DLLVM_ENABLE_ASSERTIONS=${ASSERTIONS} \
     -DLLVM_USE_LINKER=gold \
+    -DLLVM_ENABLE_RTTI=on \
     ${CMAKEDIR}
 
 echo "===> Compile llvm..."
