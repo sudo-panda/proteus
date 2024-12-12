@@ -54,7 +54,6 @@
 #include "Utils.h"
 
 using namespace proteus;
-using namespace llvm;
 using namespace llvm::orc;
 
 #if ENABLE_HIP || ENABLE_CUDA
@@ -68,40 +67,40 @@ public:
   OptimizationTransform(JitEngineHost &JitEngineImpl)
       : JitEngineImpl(JitEngineImpl) {}
 
-  Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
+  llvm::Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
                                         MaterializationResponsibility &R) {
-    TSM.withModuleDo([this](Module &M) {
-      DBG(dbgs() << "=== Begin Before Optimization\n"
+    TSM.withModuleDo([this](llvm::Module &M) {
+      DBG(llvm::dbgs() << "=== Begin Before Optimization\n"
                  << M << "=== End Before\n");
       TIMESCOPE("Run Optimization Transform");
-      JitEngineImpl.optimizeIR(M, sys::getHostCPUName());
-      DBG(dbgs() << "=== Begin After Optimization\n"
+      JitEngineImpl.optimizeIR(M, llvm::sys::getHostCPUName());
+      DBG(llvm::dbgs() << "=== Begin After Optimization\n"
                  << M << "=== End After Optimization\n");
 #if ENABLE_DEBUG
       if (verifyModule(M, &errs()))
         FATAL_ERROR(
             "Broken module found after optimization, JIT compilation aborted!");
       else
-        dbgs() << "Module after optimization verified!\n";
+        llvm::dbgs() << "Module after optimization verified!\n";
 #endif
     });
     return std::move(TSM);
   }
 
-  Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM) {
-    TSM.withModuleDo([this](Module &M) {
-      DBG(dbgs() << "=== Begin Before Optimization\n"
+  llvm::Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM) {
+    TSM.withModuleDo([this](llvm::Module &M) {
+      DBG(llvm::dbgs() << "=== Begin Before Optimization\n"
                  << M << "=== End Before\n");
       TIMESCOPE("Run Optimization Transform");
-      JitEngineImpl.optimizeIR(M, sys::getHostCPUName());
-      DBG(dbgs() << "=== Begin After Optimization\n"
+      JitEngineImpl.optimizeIR(M, llvm::sys::getHostCPUName());
+      DBG(llvm::dbgs() << "=== Begin After Optimization\n"
                  << M << "=== End After Optimization\n");
 #if ENABLE_DEBUG
       if (verifyModule(M, &errs()))
         FATAL_ERROR(
             "Broken module found after optimization, JIT compilation aborted!");
       else
-        dbgs() << "Module after optimization verified!\n";
+        llvm::dbgs() << "Module after optimization verified!\n";
 #endif
     });
     return std::move(TSM);
@@ -135,9 +134,9 @@ void JitEngineHost::addStaticLibrarySymbols() {
       cudaError_t (*)(const void *, dim3, dim3, void **, size_t, cudaStream_t);
   auto CudaLaunchKernel = static_cast<CudaLaunchKernelFn>(&cudaLaunchKernel);
   SymbolMap[LLJITPtr->mangleAndIntern("cudaLaunchKernel")] =
-      orc::ExecutorSymbolDef(
-          orc::ExecutorAddr{reinterpret_cast<uintptr_t>(CudaLaunchKernel)},
-          JITSymbolFlags::Exported);
+      llvm::orc::ExecutorSymbolDef(
+          llvm::orc::ExecutorAddr{reinterpret_cast<uintptr_t>(CudaLaunchKernel)},
+          llvm::JITSymbolFlags::Exported);
 
 #endif
   // Register the symbol manually.
@@ -145,16 +144,16 @@ void JitEngineHost::addStaticLibrarySymbols() {
 }
 
 void JitEngineHost::dumpSymbolInfo(
-    const object::ObjectFile &loadedObj,
-    const RuntimeDyld::LoadedObjectInfo &objInfo) {
+    const llvm::object::ObjectFile &loadedObj,
+    const llvm::RuntimeDyld::LoadedObjectInfo &objInfo) {
   // Dump information about symbols.
-  auto pid = sys::Process::getProcessId();
+  auto pid = llvm::sys::Process::getProcessId();
   std::error_code EC;
-  raw_fd_ostream ofd("/tmp/perf-" + std::to_string(pid) + ".map", EC,
-                     sys::fs::OF_Append);
+  llvm::raw_fd_ostream ofd("/tmp/perf-" + std::to_string(pid) + ".map", EC,
+                     llvm::sys::fs::OF_Append);
   if (EC)
     FATAL_ERROR("Cannot open perf map file");
-  for (auto symSizePair : object::computeSymbolSizes(loadedObj)) {
+  for (auto symSizePair : llvm::object::computeSymbolSizes(loadedObj)) {
     auto sym = symSizePair.first;
     auto size = symSizePair.second;
     auto symName = sym.getName();
@@ -173,12 +172,12 @@ void JitEngineHost::dumpSymbolInfo(
       // address.
       loadedSymAddress += objInfo.getSectionLoadAddress(*symbolSection.get());
     }
-    outs() << format("Address range: [%12p, %12p]", loadedSymAddress,
+    llvm::outs() << llvm::format("Address range: [%12p, %12p]", loadedSymAddress,
                      loadedSymAddress + size)
            << "\tSymbol: " << *symName << "\n";
 
     if (size > 0)
-      ofd << format("%lx %x)", loadedSymAddress, size) << " " << *symName
+      ofd << llvm::format("%lx %x)", loadedSymAddress, size) << " " << *symName
           << "\n";
   }
 
@@ -186,23 +185,23 @@ void JitEngineHost::dumpSymbolInfo(
 }
 
 void JitEngineHost::notifyLoaded(MaterializationResponsibility &R,
-                                 const object::ObjectFile &Obj,
-                                 const RuntimeDyld::LoadedObjectInfo &LOI) {
+                                 const llvm::object::ObjectFile &Obj,
+                                 const llvm::RuntimeDyld::LoadedObjectInfo &LOI) {
   dumpSymbolInfo(Obj, LOI);
 }
 
 JitEngineHost::~JitEngineHost() { CodeCache.printStats(); }
 
-Expected<orc::ThreadSafeModule>
-JitEngineHost::specializeIR(StringRef FnName, StringRef Suffix, StringRef IR,
+llvm::Expected<llvm::orc::ThreadSafeModule>
+JitEngineHost::specializeIR(llvm::StringRef FnName, llvm::StringRef Suffix, llvm::StringRef IR,
                             RuntimeConstant *RC, int NumRuntimeConstants) {
   TIMESCOPE("specializeIR");
-  auto Ctx = std::make_unique<LLVMContext>();
-  SMDiagnostic Err;
-  if (auto M = parseIR(MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()),
+  auto Ctx = std::make_unique<llvm::LLVMContext>();
+  llvm::SMDiagnostic Err;
+  if (auto M = parseIR(llvm::MemoryBufferRef(IR, ("Mod-" + FnName + Suffix).str()),
                        Err, *Ctx)) {
-    // dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n ";
-    Function *F = M->getFunction(FnName);
+    // llvm::dbgs() << "=== Parsed Module\n" << *M << "=== End of Parsed Module\n ";
+    llvm::Function *F = M->getFunction(FnName);
     assert(F && "Expected non-null function!");
 
     // Find GlobalValue declarations that are externally defined. Resolve them
@@ -214,7 +213,7 @@ JitEngineHost::specializeIR(StringRef FnName, StringRef Suffix, StringRef IR,
       if (!GV.isDeclaration())
         continue;
 
-      if (Function *F = dyn_cast<Function>(&GV))
+      if (llvm::Function *F = llvm::dyn_cast<llvm::Function>(&GV))
         if (F->isIntrinsic())
           continue;
 
@@ -225,18 +224,18 @@ JitEngineHost::specializeIR(StringRef FnName, StringRef Suffix, StringRef IR,
       // Consume the error and fix with static linking.
       consumeError(std::move(Error));
 
-      DBG(dbgs() << "Resolve statically missing GV symbol " << GV.getName()
+      DBG(llvm::dbgs() << "Resolve statically missing GV symbol " << GV.getName()
                  << "\n");
 
 #if ENABLE_CUDA || ENABLE_HIP
       if (GV.getName() == "__jit_launch_kernel") {
-        DBG(dbgs() << "Resolving via ORC jit_launch_kernel\n");
+        DBG(llvm::dbgs() << "Resolving via ORC jit_launch_kernel\n");
         SymbolMap SymbolMap;
         SymbolMap[LLJITPtr->mangleAndIntern("__jit_launch_kernel")] =
-            orc::ExecutorSymbolDef(
-                orc::ExecutorAddr{
+            llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr{
                     reinterpret_cast<uintptr_t>(__jit_launch_kernel)},
-                JITSymbolFlags::Exported);
+                llvm::JITSymbolFlags::Exported);
 
         cantFail(
             LLJITPtr->getMainJITDylib().define(absoluteSymbols(SymbolMap)));
@@ -249,35 +248,35 @@ JitEngineHost::specializeIR(StringRef FnName, StringRef Suffix, StringRef IR,
     }
     // Replace argument uses with runtime constants.
     // TODO: change NumRuntimeConstants to size_t at interface.
-    MDNode *Node = F->getMetadata("jit_arg_nos");
+    llvm::MDNode *Node = F->getMetadata("jit_arg_nos");
     assert(Node && "Expected metata for jit argument positions");
-    DBG(dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node
+    DBG(llvm::dbgs() << "Metadata jit for F " << F->getName() << " = " << *Node
                << "\n");
 
     // Replace argument uses with runtime constants.
-    SmallVector<int32_t> ArgPos;
+    llvm::SmallVector<int32_t> ArgPos;
     for (int I = 0; I < Node->getNumOperands(); ++I) {
-      ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(Node->getOperand(I));
-      ConstantInt *ConstInt = cast<ConstantInt>(CAM->getValue());
+      llvm::ConstantAsMetadata *CAM = llvm::cast<llvm::ConstantAsMetadata>(Node->getOperand(I));
+      llvm::ConstantInt *ConstInt = llvm::cast<llvm::ConstantInt>(CAM->getValue());
       int ArgNo = ConstInt->getZExtValue();
       ArgPos.push_back(ArgNo);
     }
 
     TransformArgumentSpecialization::transform(
         *M, *F, ArgPos,
-        ArrayRef<RuntimeConstant>{RC,
+        llvm::ArrayRef<RuntimeConstant>{RC,
                                   static_cast<size_t>(NumRuntimeConstants)});
 
-    // dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n";
+    // llvm::dbgs() << "=== JIT Module\n" << *M << "=== End of JIT Module\n";
 
     F->setName(FnName + Suffix);
 
 #if ENABLE_DEBUG
-    dbgs() << "=== Final Module\n" << *M << "=== End Final Module\n";
+    llvm::dbgs() << "=== Final Module\n" << *M << "=== End Final Module\n";
     if (verifyModule(*M, &errs()))
       FATAL_ERROR("Broken module found, JIT compilation aborted!");
     else
-      dbgs() << "Module verified!\n";
+      llvm::dbgs() << "Module verified!\n";
 #endif
     return ThreadSafeModule(std::move(M), std::move(Ctx));
   }
@@ -285,7 +284,7 @@ JitEngineHost::specializeIR(StringRef FnName, StringRef Suffix, StringRef IR,
   return createSMDiagnosticError(Err);
 }
 
-void *JitEngineHost::compileAndLink(StringRef FnName, char *IR, int IRSize,
+void *JitEngineHost::compileAndLink(llvm::StringRef FnName, char *IR, int IRSize,
                                     RuntimeConstant *RC,
                                     int NumRuntimeConstants) {
   TIMESCOPE("compileAndLink");
@@ -299,37 +298,37 @@ void *JitEngineHost::compileAndLink(StringRef FnName, char *IR, int IRSize,
   std::string Suffix = mangleSuffix(HashValue);
   std::string MangledFnName = FnName.str() + Suffix;
 
-  StringRef StrIR(IR, IRSize);
+  llvm::StringRef StrIR(IR, IRSize);
   // (3) Add modules.
   ExitOnErr(LLJITPtr->addIRModule(
       ExitOnErr(specializeIR(FnName, Suffix, StrIR, RC, NumRuntimeConstants))));
 
-  DBG(dbgs() << "===\n"
+  DBG(llvm::dbgs() << "===\n"
              << *LLJITPtr->getExecutionSession().getSymbolStringPool()
              << "===\n");
 
   // (4) Look up the JIT'd function.
-  DBG(dbgs() << "Lookup FnName " << FnName << " mangled as " << MangledFnName
+  DBG(llvm::dbgs() << "Lookup FnName " << FnName << " mangled as " << MangledFnName
              << "\n");
   auto EntryAddr = ExitOnErr(LLJITPtr->lookup(MangledFnName));
 
   JitFnPtr = (void *)EntryAddr.getValue();
-  DBG(dbgs() << "FnName " << FnName << " Mangled " << MangledFnName
+  DBG(llvm::dbgs() << "FnName " << FnName << " Mangled " << MangledFnName
              << " address " << JitFnPtr << "\n");
   assert(JitFnPtr && "Expected non-null JIT function pointer");
   CodeCache.insert(HashValue, JitFnPtr, FnName, RC, NumRuntimeConstants);
 
-  dbgs() << "=== JIT compile: " << FnName << " Mangled " << MangledFnName
+  llvm::dbgs() << "=== JIT compile: " << FnName << " Mangled " << MangledFnName
          << " RC HashValue " << HashValue << " Addr " << JitFnPtr << "\n";
   return JitFnPtr;
 }
 
 JitEngineHost::JitEngineHost(int argc, char *argv[]) {
-  InitLLVM X(argc, argv);
+  llvm::InitLLVM X(argc, argv);
 
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-  InitializeNativeTargetAsmParser();
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
 
   ExitOnErr.setBanner("JIT: ");
   // Create the LLJIT instance.
@@ -339,9 +338,9 @@ JitEngineHost::JitEngineHost(int argc, char *argv[]) {
   LLJITPtr =
       ExitOnErr(LLJITBuilder()
                     .setObjectLinkingLayerCreator([&](ExecutionSession &ES,
-                                                      const Triple &TT) {
+                                                      const llvm::Triple &TT) {
                       auto GetMemMgr = []() {
-                        return std::make_unique<SectionMemoryManager>();
+                        return std::make_unique<llvm::SectionMemoryManager>();
                       };
                       auto ObjLinkingLayer =
                           std::make_unique<RTDyldObjectLinkingLayer>(
@@ -349,7 +348,7 @@ JitEngineHost::JitEngineHost(int argc, char *argv[]) {
 
                       // Register the event listener.
                       ObjLinkingLayer->registerJITEventListener(
-                          *JITEventListener::createGDBRegistrationListener());
+                          *llvm::JITEventListener::createGDBRegistrationListener());
 
                       // Make sure the debug info sections aren't stripped.
                       ObjLinkingLayer->setProcessAllSections(true);
@@ -361,13 +360,13 @@ JitEngineHost::JitEngineHost(int argc, char *argv[]) {
                     })
                     .create());
   // (2) Resolve symbols in the main process.
-  orc::MangleAndInterner Mangle(LLJITPtr->getExecutionSession(),
+  llvm::orc::MangleAndInterner Mangle(LLJITPtr->getExecutionSession(),
                                 LLJITPtr->getDataLayout());
   LLJITPtr->getMainJITDylib().addGenerator(
-      ExitOnErr(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+      ExitOnErr(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
           LLJITPtr->getDataLayout().getGlobalPrefix(),
-          [MainName = Mangle("main")](const orc::SymbolStringPtr &Name) {
-            // dbgs() << "Search name " << Name << "\n";
+          [MainName = Mangle("main")](const llvm::orc::SymbolStringPtr &Name) {
+            // llvm::dbgs() << "Search name " << Name << "\n";
             return Name != MainName;
           })));
 
