@@ -15,17 +15,15 @@
 
 namespace proteus {
 
-using namespace llvm;
-
 struct TimeTracerRAII {
-  TimeTracerRAII() { timeTraceProfilerInitialize(500 /* us */, "jit"); }
+  TimeTracerRAII() { llvm::timeTraceProfilerInitialize(500 /* us */, "jit"); }
 
   ~TimeTracerRAII() {
-    if (auto E = timeTraceProfilerWrite("", "-")) {
+    if (auto E = llvm::timeTraceProfilerWrite("", "-")) {
       handleAllErrors(std::move(E));
       return;
     }
-    timeTraceProfilerCleanup();
+    llvm::timeTraceProfilerCleanup();
   }
 };
 

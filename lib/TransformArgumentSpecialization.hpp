@@ -19,57 +19,55 @@
 
 namespace proteus {
 
-using namespace llvm;
-
 class TransformArgumentSpecialization {
 public:
-  static void transform(Module &M, Function &F,
-                        const SmallVectorImpl<int32_t> &ArgPos,
-                        ArrayRef<RuntimeConstant> RC) {
+  static void transform(llvm::Module &M, llvm::Function &F,
+                        const llvm::SmallVectorImpl<int32_t> &ArgPos,
+                        llvm::ArrayRef<RuntimeConstant> RC) {
     auto &Ctx = M.getContext();
 
     // Replace argument uses with runtime constants.
     for (int I = 0; I < ArgPos.size(); ++I) {
       int ArgNo = ArgPos[I];
-      Value *Arg = F.getArg(ArgNo);
-      Type *ArgType = Arg->getType();
-      Constant *C = nullptr;
+      llvm::Value *Arg = F.getArg(ArgNo);
+      llvm::Type *ArgType = Arg->getType();
+      llvm::Constant *C = nullptr;
       if (ArgType->isIntegerTy(1)) {
-        C = ConstantInt::get(ArgType, RC[I].Value.BoolVal);
+        C = llvm::ConstantInt::get(ArgType, RC[I].Value.BoolVal);
       } else if (ArgType->isIntegerTy(8)) {
-        C = ConstantInt::get(ArgType, RC[I].Value.Int8Val);
+        C = llvm::ConstantInt::get(ArgType, RC[I].Value.Int8Val);
       } else if (ArgType->isIntegerTy(32)) {
-        // dbgs() << "RC is Int32\n";
-        C = ConstantInt::get(ArgType, RC[I].Value.Int32Val);
+        // llvm::dbgs() << "RC is Int32\n";
+        C = llvm::ConstantInt::get(ArgType, RC[I].Value.Int32Val);
       } else if (ArgType->isIntegerTy(64)) {
-        // dbgs() << "RC is Int64\n";
-        C = ConstantInt::get(ArgType, RC[I].Value.Int64Val);
+        // llvm::dbgs() << "RC is Int64\n";
+        C = llvm::ConstantInt::get(ArgType, RC[I].Value.Int64Val);
       } else if (ArgType->isFloatTy()) {
-        // dbgs() << "RC is Float\n";
-        C = ConstantFP::get(ArgType, RC[I].Value.FloatVal);
+        // llvm::dbgs() << "RC is Float\n";
+        C = llvm::ConstantFP::get(ArgType, RC[I].Value.FloatVal);
       }
       // NOTE: long double on device should correspond to plain double.
       // XXX: CUDA with a long double SILENTLY fails to create a working
       // kernel in AOT compilation, with or without JIT.
       else if (ArgType->isDoubleTy()) {
-        // dbgs() << "RC is Double\n";
-        C = ConstantFP::get(ArgType, RC[I].Value.DoubleVal);
+        // llvm::dbgs() << "RC is Double\n";
+        C = llvm::ConstantFP::get(ArgType, RC[I].Value.DoubleVal);
       } else if (ArgType->isX86_FP80Ty() || ArgType->isPPC_FP128Ty() ||
                  ArgType->isFP128Ty()) {
-        C = ConstantFP::get(ArgType, RC[I].Value.LongDoubleVal);
+        C = llvm::ConstantFP::get(ArgType, RC[I].Value.LongDoubleVal);
       } else if (ArgType->isPointerTy()) {
         auto *IntC =
-            ConstantInt::get(Type::getInt64Ty(Ctx), RC[I].Value.Int64Val);
-        C = ConstantExpr::getIntToPtr(IntC, ArgType);
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), RC[I].Value.Int64Val);
+        C = llvm::ConstantExpr::getIntToPtr(IntC, ArgType);
       } else {
         std::string TypeString;
-        raw_string_ostream TypeOstream(TypeString);
+        llvm::raw_string_ostream TypeOstream(TypeString);
         ArgType->print(TypeOstream);
         FATAL_ERROR("JIT Incompatible type in runtime constant: " +
                     TypeOstream.str());
       }
 
-      DBG(dbgs() << "[ArgSpecial] Replaced Function " << F.getName() + " ArgNo "
+      DBG(llvm::dbgs() << "[ArgSpecial] Replaced Function " << F.getName() + " ArgNo "
                  << ArgNo << " with value " << *C << "\n");
       Arg->replaceAllUsesWith(C);
     }

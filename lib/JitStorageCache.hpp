@@ -21,8 +21,6 @@
 
 namespace proteus {
 
-using namespace llvm;
-
 // NOTE: Storage cache assumes that stored code is re-usable across runs!
 // TODO: Source code changes should invalidate the cache. Also, if storing
 // assembly (PTX) or binary (ELF), then device globals may have different
@@ -31,15 +29,15 @@ using namespace llvm;
 template <typename Function_t> class JitStorageCache {
 public:
   JitStorageCache() { std::filesystem::create_directory(StorageDirectory); }
-  std::unique_ptr<MemoryBuffer> lookupObject(uint64_t HashValue,
-                                             StringRef Kernel) {
+  std::unique_ptr<llvm::MemoryBuffer> lookupObject(uint64_t HashValue,
+                                                   llvm::StringRef Kernel) {
     TIMESCOPE("object lookup");
     Accesses++;
 
     std::string Filepath =
         StorageDirectory + "/cache-jit-" + std::to_string(HashValue) + ".o";
 
-    auto MemBuffer = MemoryBuffer::getFile(Filepath);
+    auto MemBuffer = llvm::MemoryBuffer::getFile(Filepath);
     if (!MemBuffer)
       return nullptr;
 
@@ -47,15 +45,15 @@ public:
     return std::move(MemBuffer.get());
   }
 
-  std::unique_ptr<MemoryBuffer> lookupBitcode(uint64_t HashValue,
-                                              StringRef Kernel) {
+  std::unique_ptr<llvm::MemoryBuffer> lookupBitcode(uint64_t HashValue,
+                                                    llvm::StringRef Kernel) {
     TIMESCOPE("object lookup");
     Accesses++;
 
     std::string Filepath =
         StorageDirectory + "/cache-jit-" + std::to_string(HashValue) + ".bc";
 
-    auto MemBuffer = MemoryBuffer::getFile(Filepath);
+    auto MemBuffer = llvm::MemoryBuffer::getFile(Filepath);
     if (!MemBuffer)
       return nullptr;
 
@@ -63,15 +61,15 @@ public:
     return std::move(MemBuffer.get());
   }
 
-  void storeObject(uint64_t HashValue, MemoryBufferRef ObjBufRef) {
+  void storeObject(uint64_t HashValue, llvm::MemoryBufferRef ObjBufRef) {
     TIMESCOPE("Store object");
     saveToFile(
         (StorageDirectory + "/cache-jit-" + std::to_string(HashValue) + ".o"),
         HashValue,
-        StringRef{ObjBufRef.getBufferStart(), ObjBufRef.getBufferSize()});
+        llvm::StringRef{ObjBufRef.getBufferStart(), ObjBufRef.getBufferSize()});
   }
 
-  void storeBitcode(uint64_t HashValue, StringRef IR) {
+  void storeBitcode(uint64_t HashValue, llvm::StringRef IR) {
     saveToFile(
         (StorageDirectory + "/cache-jit-" + std::to_string(HashValue) + ".bc"),
         HashValue, IR);
@@ -87,9 +85,9 @@ private:
   uint64_t Accesses = 0;
   const std::string StorageDirectory = ".proteus";
 
-  void saveToFile(StringRef Filepath, uint64_t HashValue, StringRef Data) {
+  void saveToFile(llvm::StringRef Filepath, uint64_t HashValue, llvm::StringRef Data) {
     std::error_code EC;
-    raw_fd_ostream Out(Filepath, EC);
+    llvm::raw_fd_ostream Out(Filepath, EC);
     if (EC)
       FATAL_ERROR("Cannot open file" + Filepath);
     Out << Data;

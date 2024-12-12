@@ -22,15 +22,13 @@
 
 namespace proteus {
 
-using namespace llvm;
-
-static inline Error createSMDiagnosticError(SMDiagnostic &Diag) {
+static inline llvm::Error createSMDiagnosticError(llvm::SMDiagnostic &Diag) {
   std::string Msg;
   {
-    raw_string_ostream OS(Msg);
+    llvm::raw_string_ostream OS(Msg);
     Diag.print("", OS);
   }
-  return make_error<StringError>(std::move(Msg), inconvertibleErrorCode());
+  return llvm::make_error<llvm::StringError>(std::move(Msg), llvm::inconvertibleErrorCode());
 }
 
 static inline bool getEnvOrDefaultBool(const char *VarName, bool Default) {
@@ -41,13 +39,13 @@ static inline bool getEnvOrDefaultBool(const char *VarName, bool Default) {
 
 class JitEngine {
 public:
-  void optimizeIR(Module &M, StringRef Arch);
+  void optimizeIR(llvm::Module &M, llvm::StringRef Arch);
 
 protected:
-  Expected<std::unique_ptr<TargetMachine>>
-  createTargetMachine(Module &M, StringRef Arch, unsigned OptLevel = 3);
+  llvm::Expected<std::unique_ptr<llvm::TargetMachine>>
+  createTargetMachine(llvm::Module &M, llvm::StringRef Arch, unsigned OptLevel = 3);
 
-  void runOptimizationPassPipeline(Module &M, StringRef Arch,
+  void runOptimizationPassPipeline(llvm::Module &M, llvm::StringRef Arch,
                                    unsigned OptLevel = 3);
 
   JitEngine();

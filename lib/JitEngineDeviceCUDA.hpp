@@ -18,8 +18,6 @@
 
 namespace proteus {
 
-using namespace llvm;
-
 class JitEngineDeviceCUDA;
 template <> struct DeviceTraits<JitEngineDeviceCUDA> {
   using DeviceError_t = cudaError_t;
@@ -81,16 +79,16 @@ public:
 
   void *resolveDeviceGlobalAddr(const void *Addr);
 
-  void setLaunchBoundsForKernel(Module &M, Function &F, size_t GridSize,
+  void setLaunchBoundsForKernel(llvm::Module &M, llvm::Function &F, size_t GridSize,
                                 int BlockSize);
 
-  std::unique_ptr<MemoryBuffer> extractDeviceBitcode(StringRef KernelName,
-                                                     void *Kernel);
+  std::unique_ptr<llvm::MemoryBuffer> extractDeviceBitcode(llvm::StringRef KernelName,
+                                                           void *Kernel);
 
-  void codegenPTX(Module &M, StringRef DeviceArch,
-                  SmallVectorImpl<char> &PTXStr);
+  void codegenPTX(llvm::Module &M, llvm::StringRef DeviceArch,
+                  llvm::SmallVectorImpl<char> &PTXStr);
 
-  std::unique_ptr<MemoryBuffer> codegenObject(Module &M, StringRef DeviceArch);
+  std::unique_ptr<llvm::MemoryBuffer> codegenObject(llvm::Module &M, llvm::StringRef DeviceArch);
 
   cudaError_t
   cudaModuleLaunchKernel(CUfunction f, unsigned int gridDimX,
@@ -99,7 +97,7 @@ public:
                          unsigned int blockDimZ, unsigned int sharedMemBytes,
                          CUstream hStream, void **kernelParams, void **extra);
 
-  CUfunction getKernelFunctionFromImage(StringRef KernelName,
+  CUfunction getKernelFunctionFromImage(llvm::StringRef KernelName,
                                         const void *Image);
 
   cudaError_t launchKernelFunction(CUfunction KernelFunc, dim3 GridDim,
@@ -115,8 +113,8 @@ private:
   JitEngineDeviceCUDA(JitEngineDeviceCUDA &) = delete;
   JitEngineDeviceCUDA(JitEngineDeviceCUDA &&) = delete;
 
-  void extractLinkedBitcode(LLVMContext &Ctx, CUmodule &CUMod,
-                            SmallVector<std::unique_ptr<Module>> &LinkedModules,
+  void extractLinkedBitcode(llvm::LLVMContext &Ctx, CUmodule &CUMod,
+                            llvm::SmallVector<std::unique_ptr<llvm::Module>> &LinkedModules,
                             std::string &ModuleId);
 };
 

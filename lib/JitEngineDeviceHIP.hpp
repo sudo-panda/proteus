@@ -16,8 +16,6 @@
 
 namespace proteus {
 
-using namespace llvm;
-
 class JitEngineDeviceHIP;
 template <> struct DeviceTraits<JitEngineDeviceHIP> {
   using DeviceError_t = hipError_t;

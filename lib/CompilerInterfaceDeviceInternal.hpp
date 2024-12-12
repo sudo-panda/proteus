@@ -6,7 +6,6 @@ __jit_launch_kernel_internal(const char *ModuleUniqueId, void *Kernel,
                              dim3 GridDim, dim3 BlockDim, void **KernelArgs,
                              uint64_t ShmemSize, void *Stream) {
 
-  using namespace llvm;
   using namespace proteus;
   auto &Jit = JitDeviceImplT::instance();
   auto optionalKernelInfo = Jit.getJITKernelInfo(Kernel);
@@ -22,17 +21,17 @@ __jit_launch_kernel_internal(const char *ModuleUniqueId, void *Kernel,
   auto RCIndices = KernelInfo.getRCIndices();
 
   auto printKernelLaunchInfo = [&]() {
-    dbgs() << "JIT Launch Kernel\n";
-    dbgs() << "=== Kernel Info\n";
-    dbgs() << "KernelName " << KernelName << "\n";
-    dbgs() << "Grid " << GridDim.x << ", " << GridDim.y << ", " << GridDim.z
+    llvm::dbgs() << "JIT Launch Kernel\n";
+    llvm::dbgs() << "=== Kernel Info\n";
+    llvm::dbgs() << "KernelName " << KernelName << "\n";
+    llvm::dbgs() << "Grid " << GridDim.x << ", " << GridDim.y << ", " << GridDim.z
            << "\n";
-    dbgs() << "Block " << BlockDim.x << ", " << BlockDim.y << ", " << BlockDim.z
+    llvm::dbgs() << "Block " << BlockDim.x << ", " << BlockDim.y << ", " << BlockDim.z
            << "\n";
-    dbgs() << "KernelArgs " << KernelArgs << "\n";
-    dbgs() << "ShmemSize " << ShmemSize << "\n";
-    dbgs() << "Stream " << Stream << "\n";
-    dbgs() << "=== End Kernel Info\n";
+    llvm::dbgs() << "KernelArgs " << KernelArgs << "\n";
+    llvm::dbgs() << "ShmemSize " << ShmemSize << "\n";
+    llvm::dbgs() << "Stream " << Stream << "\n";
+    llvm::dbgs() << "=== End Kernel Info\n";
   };
 
   TIMESCOPE("__jit_launch_kernel");
