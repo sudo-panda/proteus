@@ -449,6 +449,18 @@ JitEngineDevice<ImplT>::compileAndRun(
   std::string Suffix = mangleSuffix(HashValue);
   std::string KernelMangled = (KernelName + Suffix).str();
 
+  torch::jit::script::Module module;
+  try {
+    torch::Tensor inp = torch::rand({20});
+    module = torch::jit::load("/usr/WS2/kundu1/RT_Tuner/examples/ts-ex/my_module_model.pt");
+    torch::Tensor out = module.forward({inp}).toTensor();
+    std::cout << "Input Tensor:\n" << inp << std::endl;
+    std::cout << "Output Tensor:\n" << out << std::endl;
+  }
+  catch (const c10::Error& e) {
+    std::cerr << "error loading the model\n";
+  }
+
   if (Config.ENV_PROTEUS_USE_STORED_CACHE) {
     // If there device global variables, lookup the IR and codegen object
     // before launching. Else, if there aren't device global variables, lookup
@@ -484,14 +496,6 @@ JitEngineDevice<ImplT>::compileAndRun(
       return launchKernelFunction(KernelFunc, GridDim, BlockDim, KernelArgs,
                                   ShmemSize, Stream);
     }
-  }
-
-  torch::jit::script::Module module;
-  try {
-    module = torch::jit::load("/usr/WS2/kundu1/RT_Tuner/torchscript/my_module_model.pt");
-  }
-  catch (const c10::Error& e) {
-    std::cerr << "error loading the model\n";
   }
 
   specializeIR(*JitModule, KernelName, Suffix, BlockDim, GridDim, RCIndices,
