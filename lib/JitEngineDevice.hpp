@@ -17,6 +17,7 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <memory>
@@ -36,7 +37,6 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <optional>
-#include <torch/script.h>
 
 #include "CompilerInterfaceTypes.h"
 #include "JitCache.hpp"
@@ -246,6 +246,28 @@ private:
     }
   }
 
+  void getOptInfoFromModule(llvm::Module &M, llvm::StringRef KernelName,
+                            llvm::SmallVector<int, 3> &OptInfo) {
+    llvm::Function *F = M.getFunction(KernelName);
+    llvm::MDNode *Node = F->getMetadata("jit_opt_info");
+
+    unsigned int NumOps = Node->getNumOperands();
+
+    for (unsigned int I = 0; I < NumOps; I++) {
+      llvm::Metadata *Meta = Node->getOperand(I).get();
+      if (llvm::ConstantAsMetadata *ConstAsMeta =
+              llvm::dyn_cast<llvm::ConstantAsMetadata>(Meta)) {
+        llvm::Constant *Const = ConstAsMeta->getValue();
+
+        if (llvm::ConstantInt *ConstInt =
+                llvm::dyn_cast<llvm::ConstantInt>(Const)) {
+          int value = ConstInt->getSExtValue();
+          OptInfo.push_back(value);
+        }
+      }
+    }
+  }
+
   DeviceError_t launchKernelFunction(KernelFunction_t KernelFunc, dim3 GridDim,
                                      dim3 BlockDim, void **KernelArgs,
                                      uint64_t ShmemSize,
@@ -449,17 +471,9 @@ JitEngineDevice<ImplT>::compileAndRun(
   std::string Suffix = mangleSuffix(HashValue);
   std::string KernelMangled = (KernelName + Suffix).str();
 
-  torch::jit::script::Module module;
-  try {
-    torch::Tensor inp = torch::rand({20});
-    module = torch::jit::load("/usr/WS2/kundu1/RT_Tuner/examples/ts-ex/my_module_model.pt");
-    torch::Tensor out = module.forward({inp}).toTensor();
-    std::cout << "Input Tensor:\n" << inp << std::endl;
-    std::cout << "Output Tensor:\n" << out << std::endl;
-  }
-  catch (const c10::Error& e) {
-    std::cerr << "error loading the model\n";
-  }
+  llvm::SmallVector<int, 3> OptInfo;
+  getOptInfoFromModule(*JitModule, KernelName, OptInfo);
+  PT.processOptInfo(OptInfo);
 
   if (Config.ENV_PROTEUS_USE_STORED_CACHE) {
     // If there device global variables, lookup the IR and codegen object

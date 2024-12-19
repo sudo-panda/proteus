@@ -18,6 +18,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Target/TargetMachine.h"
 
+#include "protorch.hpp"
+
 #include "Utils.h"
 
 namespace proteus {
@@ -38,6 +40,9 @@ static inline bool getEnvOrDefaultBool(const char *VarName, bool Default) {
 }
 
 class JitEngine {
+protected:
+  ProTorch PT;
+
 public:
   void optimizeIR(llvm::Module &M, llvm::StringRef Arch);
 

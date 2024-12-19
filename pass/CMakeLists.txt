@@ -9,8 +9,16 @@ endif()
 
 # Allow undefined symbols in shared objects on Darwin (this is the default
 # behaviour on Linux)
-target_link_libraries(ProteusPass
+target_link_libraries(ProteusPass PUBLIC
   "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
+
+if(ENABLE_PROTORCH)
+  find_package(ProTorch REQUIRED)
+
+  target_link_libraries(ProteusPass PRIVATE ${ProTorch_LIBRARIES})
+  target_include_directories(ProteusPass 
+                SYSTEM PRIVATE ${ProTorch_INCLUDE_DIRS})
+endif()
 
 target_compile_options(
   ProteusPass

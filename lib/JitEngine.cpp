@@ -106,7 +106,7 @@ void JitEngine::runOptimizationPassPipeline(Module &M, StringRef Arch,
   Passes.run(M, MAM);
 }
 
-JitEngine::JitEngine() {
+JitEngine::JitEngine() : PT(/* runtime */ true) {
   Config.ENV_PROTEUS_USE_STORED_CACHE =
       getEnvOrDefaultBool("ENV_PROTEUS_USE_STORED_CACHE", true);
   Config.ENV_PROTEUS_SET_LAUNCH_BOUNDS =

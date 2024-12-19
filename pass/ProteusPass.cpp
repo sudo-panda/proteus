@@ -43,6 +43,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/Constant.h>
@@ -62,6 +63,8 @@
 
 #include <iostream>
 #include <string>
+
+#include <protorch.hpp>
 
 #define DEBUG_TYPE "jitpass"
 #ifdef ENABLE_DEBUG
@@ -100,7 +103,7 @@ namespace {
 
 class ProteusJitPassImpl {
 public:
-  ProteusJitPassImpl(Module &M) {
+  ProteusJitPassImpl(Module &M) : PT() {
     PtrTy = PointerType::getUnqual(M.getContext());
     VoidTy = Type::getVoidTy(M.getContext());
     Int8Ty = Type::getInt8Ty(M.getContext());
@@ -181,6 +184,7 @@ private:
   MapVector<Function *, JitFunctionInfo> JitFunctionInfoMap;
   DenseMap<Value *, GlobalVariable *> StubToKernelMap;
   SmallPtrSet<Function *, 16> ModuleDeviceKernels;
+  ProTorch PT;
 
   bool isDeviceCompilation(Module &M) {
     Triple TargetTriple(M.getTargetTriple());
@@ -413,6 +417,24 @@ private:
   }
 
   void emitJitModuleDevice(Module &M, bool IsLTO) {
+    for (auto &JFI : JitFunctionInfoMap) {
+      Function *JITFn = JFI.first;
+      DEBUG(dbgs() << "Adding Optimizing Metadata to JIT Function "
+                   << JITFn->getName() << "\n");
+
+      auto InstrCounts = PT.getInstrCounts(*JITFn);
+      LLVMContext &Ctx = M.getContext();
+      SmallVector<Metadata *> OptInfo;
+      for (size_t I = 0; I < InstrCounts.size(); ++I) {
+        int InstrCount = InstrCounts[I];
+        Metadata *Meta =
+            ConstantAsMetadata::get(ConstantInt::get(Int32Ty, InstrCount));
+        OptInfo.push_back(Meta);
+      }
+      MDNode *Node = MDNode::get(Ctx, OptInfo);
+      JITFn->setMetadata("jit_opt_info", Node);
+    }
+
     std::string BitcodeStr;
     raw_string_ostream OS(BitcodeStr);
     WriteBitcodeToFile(M, OS);
