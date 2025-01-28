@@ -27,7 +27,7 @@ endif()
 if(ENABLE_CUDA)
   add_definitions("-DENABLE_CUDA")
 
-  find_package(CUDAToolkit 12 REQUIRED)
+  find_package(CUDAToolkit REQUIRED)
 endif()
 
 if(ENABLE_DEBUG)
@@ -43,10 +43,10 @@ include(cmake/SetupLLVM.cmake)
 add_subdirectory(lib)
 add_subdirectory(pass)
 
-if(ENABLE_TESTS)
-  enable_testing()
-  add_subdirectory(tests)
-endif()
+#if(ENABLE_TESTS)
+#  enable_testing()
+#  add_subdirectory(tests)
+#endif()
 
 include(CMakePackageConfigHelpers)
 

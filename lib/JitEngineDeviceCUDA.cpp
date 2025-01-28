@@ -212,7 +212,7 @@ void JitEngineDeviceCUDA::codegenPTX(Module &M, StringRef DeviceArch,
       reinterpret_cast<LLVMTargetMachine *>(TM.get()));
 
   raw_svector_ostream PTXOS(PTXStr);
-  TM->addPassesToEmitFile(PM, PTXOS, nullptr, CGFT_AssemblyFile,
+  TM->addPassesToEmitFile(PM, PTXOS, nullptr, CodeGenFileType::AssemblyFile,
                           /* DisableVerify */ false, MMIWP);
 
   PM.run(M);
