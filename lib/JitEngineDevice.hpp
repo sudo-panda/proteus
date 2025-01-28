@@ -246,26 +246,27 @@ private:
     }
   }
 
-  void getOptInfoFromModule(llvm::Module &M, llvm::StringRef KernelName,
-                            llvm::SmallVector<int, 3> &OptInfo) {
+  std::vector<double> getEmbedFromModule(llvm::Module &M, llvm::StringRef KernelName) {
     llvm::Function *F = M.getFunction(KernelName);
     llvm::MDNode *Node = F->getMetadata("jit_opt_info");
 
+    std::vector<double> Embed;
     unsigned int NumOps = Node->getNumOperands();
-
     for (unsigned int I = 0; I < NumOps; I++) {
       llvm::Metadata *Meta = Node->getOperand(I).get();
       if (llvm::ConstantAsMetadata *ConstAsMeta =
               llvm::dyn_cast<llvm::ConstantAsMetadata>(Meta)) {
         llvm::Constant *Const = ConstAsMeta->getValue();
 
-        if (llvm::ConstantInt *ConstInt =
-                llvm::dyn_cast<llvm::ConstantInt>(Const)) {
-          int value = ConstInt->getSExtValue();
-          OptInfo.push_back(value);
+        if (auto *ConstFP =
+                llvm::dyn_cast<llvm::ConstantFP>(Const)) {
+          double value = ConstFP->getValue().convertToDouble();
+          Embed.push_back(value);
         }
       }
     }
+
+    return Embed;
   }
 
   DeviceError_t launchKernelFunction(KernelFunction_t KernelFunc, dim3 GridDim,
@@ -471,9 +472,8 @@ JitEngineDevice<ImplT>::compileAndRun(
   std::string Suffix = mangleSuffix(HashValue);
   std::string KernelMangled = (KernelName + Suffix).str();
 
-  llvm::SmallVector<int, 3> OptInfo;
-  getOptInfoFromModule(*JitModule, KernelName, OptInfo);
-  PT.processOptInfo(OptInfo);
+  auto Embed = getEmbedFromModule(*JitModule, KernelName);
+  PT.processEmbed(Embed);
 
   if (Config.ENV_PROTEUS_USE_STORED_CACHE) {
     // If there device global variables, lookup the IR and codegen object

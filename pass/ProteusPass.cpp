@@ -42,6 +42,7 @@
 #include "llvm/Transforms/IPO/StripSymbols.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <filesystem>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
@@ -65,6 +66,8 @@
 #include <string>
 
 #include <protorch.hpp>
+#include <system_error>
+#include <vector>
 
 #define DEBUG_TYPE "jitpass"
 #ifdef ENABLE_DEBUG
@@ -101,6 +104,19 @@ using namespace llvm;
 //-----------------------------------------------------------------------------
 namespace {
 
+std::string CreateBCFileFromModule(const Module&M) {
+  std::filesystem::path FilePath = M.getModuleIdentifier();
+  FilePath.replace_extension(".bc");
+
+  const std::string &FileName = FilePath.string();
+  std::cout << FileName << std::endl;
+  std::error_code EC;
+  llvm::raw_fd_ostream FD(FileName, EC);
+  WriteBitcodeToFile(M, FD);
+  FD.flush();
+  return FileName;
+}
+
 class ProteusJitPassImpl {
 public:
   ProteusJitPassImpl(Module &M) : PT() {
@@ -110,6 +126,7 @@ public:
     Int32Ty = Type::getInt32Ty(M.getContext());
     Int64Ty = Type::getInt64Ty(M.getContext());
     Int128Ty = Type::getInt128Ty(M.getContext());
+    DoubleTy = Type::getDoubleTy(M.getContext());
     RuntimeConstantTy = StructType::create({Int128Ty}, "struct.args");
   }
 
@@ -174,6 +191,7 @@ private:
   Type *Int32Ty = nullptr;
   Type *Int64Ty = nullptr;
   Type *Int128Ty = nullptr;
+  Type *DoubleTy = nullptr;
   StructType *RuntimeConstantTy = nullptr;
 
   struct JitFunctionInfo {
@@ -416,19 +434,28 @@ private:
                  << *JitMod << "=== End of Final Host JIT Module\n");
   }
 
+
   void emitJitModuleDevice(Module &M, bool IsLTO) {
+    auto BCFile = CreateBCFileFromModule(M);
+    std::vector<std::string> FnNames;
     for (auto &JFI : JitFunctionInfoMap) {
       Function *JITFn = JFI.first;
-      DEBUG(dbgs() << "Adding Optimizing Metadata to JIT Function "
-                   << JITFn->getName() << "\n");
+      FnNames.push_back(JITFn->getName().str());
+    }
 
-      auto InstrCounts = PT.getInstrCounts(*JITFn);
-      LLVMContext &Ctx = M.getContext();
+
+    auto Embeds = PT.getEmbeds(BCFile, FnNames);
+
+    LLVMContext &Ctx = M.getContext();
+    int index = 0;
+    for (auto &JFI : JitFunctionInfoMap) {
+      Function *JITFn = JFI.first;
+      const auto &Embed = Embeds[index++];
+
       SmallVector<Metadata *> OptInfo;
-      for (size_t I = 0; I < InstrCounts.size(); ++I) {
-        int InstrCount = InstrCounts[I];
+      for (double Ele : Embed) {
         Metadata *Meta =
-            ConstantAsMetadata::get(ConstantInt::get(Int32Ty, InstrCount));
+            ConstantAsMetadata::get(ConstantFP::get(Type::getDoubleTy(Ctx), Ele));
         OptInfo.push_back(Meta);
       }
       MDNode *Node = MDNode::get(Ctx, OptInfo);
