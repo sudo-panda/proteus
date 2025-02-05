@@ -23,7 +23,8 @@ cmake .. \
 -DCMAKE_CUDA_COMPILER="$LLVM_INSTALL_DIR/bin/clang++" \
 -DCMAKE_EXPORT_COMPILE_COMMANDS=on \
 -DCMAKE_INSTALL_PREFIX="install-lassen" \
--DProTorch_DIR=/usr/workspace/koparasy/Protorch/build-lassen 
+-DProTorch_DIR=/usr/WS2/kundu1/RT_Tuner/protorch/build-lassen
+# -DLLVM_ENABLE_RTTI=ON
 
 popd
 

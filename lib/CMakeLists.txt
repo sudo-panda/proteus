@@ -91,8 +91,8 @@ if(ENABLE_CUDA)
     ${CUDAToolkit_LIBRARY_DIR}/libnvptxcompiler_static.a)
 endif()
 
-# Need to build with RTTI on for LibTorch to work
-target_compile_options(proteus PUBLIC -frtti)
+# # Need to build with RTTI on for LibTorch to work
+# target_compile_options(proteus PUBLIC -frtti)
 
 target_link_libraries(proteus PRIVATE ${libs} "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>")
 

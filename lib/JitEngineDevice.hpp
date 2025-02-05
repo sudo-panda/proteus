@@ -248,7 +248,7 @@ private:
 
   std::vector<double> getEmbedFromModule(llvm::Module &M, llvm::StringRef KernelName) {
     llvm::Function *F = M.getFunction(KernelName);
-    llvm::MDNode *Node = F->getMetadata("jit_opt_info");
+    llvm::MDNode *Node = F->getMetadata("__jit_opt_info");
 
     std::vector<double> Embed;
     unsigned int NumOps = Node->getNumOperands();

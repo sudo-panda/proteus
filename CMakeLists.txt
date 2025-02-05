@@ -43,10 +43,10 @@ include(cmake/SetupLLVM.cmake)
 add_subdirectory(lib)
 add_subdirectory(pass)
 
-#if(ENABLE_TESTS)
-#  enable_testing()
-#  add_subdirectory(tests)
-#endif()
+if(ENABLE_TESTS)
+ enable_testing()
+ add_subdirectory(tests)
+endif()
 
 include(CMakePackageConfigHelpers)
 

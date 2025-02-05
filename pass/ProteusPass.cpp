@@ -65,9 +65,11 @@
 #include <iostream>
 #include <string>
 
+#ifdef ENABLE_PROTORCH
 #include <protorch.hpp>
 #include <system_error>
 #include <vector>
+#endif
 
 #define DEBUG_TYPE "jitpass"
 #ifdef ENABLE_DEBUG
@@ -459,7 +461,7 @@ private:
         OptInfo.push_back(Meta);
       }
       MDNode *Node = MDNode::get(Ctx, OptInfo);
-      JITFn->setMetadata("jit_opt_info", Node);
+      JITFn->setMetadata("__jit_opt_info", Node);
     }
 
     std::string BitcodeStr;

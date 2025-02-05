@@ -7,7 +7,9 @@
 
 #include "gpu_common.h"
 
+
 __global__ __attribute__((annotate("jit", 4), noinline)) void
+__launch_bounds__(256, 2)
 daxpy_impl(double a, double *x, double *y, int N) {
   std::size_t i = blockIdx.x * 256 + threadIdx.x;
   if (i < N) {
